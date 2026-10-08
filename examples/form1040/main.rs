@@ -2,14 +2,12 @@
 //!
 //!     cargo run --example form1040
 
-mod tax;
-
-use factlet::lisp::load;
+use factlet::lisp::{Domain, load};
 
 const SOURCE: &str = include_str!("form1040.lisp");
 
 fn main() {
-    let program = match load(SOURCE, &tax::domain()) {
+    let program = match load(SOURCE, &Domain::new()) {
         Ok(p) => p,
         Err(errors) => {
             for e in errors {

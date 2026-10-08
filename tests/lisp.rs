@@ -406,3 +406,70 @@ fn default_diagnostics() {
         ["1:1: expected (input name : type [:default value] [:key value…])"]
     );
 }
+
+#[test]
+fn brackets() {
+    let p = program(
+        "(input income : usd)
+         (def schedule [10% $100 20% $300 30%])
+         (def tax (brackets income schedule))
+         (def plain (brackets 1,000 [1% 500 2%]))",
+    );
+    let mut c = p.case();
+    assert_eq!(get(&p, &mut c, "tax"), "?");
+    // $10 below the first edge, $40 between the edges, 30% above.
+    for (income, tax) in [
+        ("$0", "$0.00"),
+        ("-$50", "$0.00"),
+        ("$50", "$5.00"),
+        ("$100", "$10.00"),
+        ("$300", "$50.00"),
+        ("$1,000", "$260.00"),
+    ] {
+        p.set(&mut c, p.id("income").unwrap(), income).unwrap();
+        assert_eq!(get(&p, &mut c, "tax"), tax, "on {income}");
+    }
+    assert_eq!(get(&p, &mut c, "plain"), "15");
+}
+
+#[test]
+fn brackets_diagnostics() {
+    assert_eq!(
+        errors(
+            "(def a (brackets $5 [10% $100]))
+             (def b (brackets $5 [10% 100 12%]))
+             (def c (brackets $5 [$1 $100 12%]))
+             (def d (brackets $5 10%))"
+        ),
+        [
+            "1:8: `brackets`: the schedule must end with a rate",
+            "2:21: `brackets`: schedule item 2 is number, expected usd",
+            "3:21: `brackets`: schedule item 1 is usd, expected number",
+            "4:21: `brackets`: expected (brackets amount [rate edge … rate])",
+        ]
+    );
+}
+
+#[test]
+fn domain_functions() {
+    let mut domain = Domain::new();
+    domain.builtin(
+        "double",
+        |args| match args {
+            [t] => Ok(t.clone()),
+            _ => Err("expected (double x)".into()),
+        },
+        |args| match &args[0] {
+            Value::Num(q) => Value::Num(q.add(q).unwrap()),
+            _ => unreachable!("checked"),
+        },
+    );
+    let p = load(&format!("{USD}(input x : usd) (def y (double x))"), &domain).unwrap();
+    let mut c = p.case();
+    assert_eq!(get(&p, &mut c, "y"), "?");
+    p.set(&mut c, p.id("x").unwrap(), "$4").unwrap();
+    assert_eq!(get(&p, &mut c, "y"), "$8.00");
+
+    let errs = load("(def y (double 1 2))", &domain).err().unwrap();
+    assert_eq!(errs[0].message, "`double`: expected (double x)");
+}

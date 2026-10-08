@@ -83,8 +83,9 @@ blocking it. `--set` answers a global input as written in source; a
 `--case` file answers anything with the scenario forms of §7. Includes are
 read relative to the main file.
 
-A program that needs its own units or built-in functions (§6) can ship
-the same command, built on its domain:
+Units, enums and `brackets` are part of the language, so a tax program
+needs nothing more. A program that needs functions written in Rust (§6)
+can ship the same command, built on its domain:
 
 ```rust
 fn main() -> std::process::ExitCode {
@@ -404,6 +405,17 @@ for tools, available from Rust as `Program::meta`. Three keys are shown by
 `(floor 0.01 rate)`. Unit mismatches are reported when the program loads;
 division by zero and overflow are runtime Errors.
 
+`(brackets amount [rate edge rate edge … rate])` applies a progressive
+schedule: each rate is charged on the part of `amount` up to the edge after
+it, and the last rate on everything above the last edge. Rates are plain
+numbers and edges are in `amount`'s unit, which is the result's:
+
+```lisp
+(def law/brackets/single [10% $11,925  12% $48,475  22% $103,350  24%])
+(def tax (round $1 (brackets taxable-income law/brackets/single)))
+; $42,250 → $1,192.50 + 12% × ($42,250 − $11,925) = $4,831.50 → $4,832
+```
+
 ### 4.3 Comparison
 
 | Form                                | Notes                                     |
@@ -516,11 +528,11 @@ load time, and an evaluator, which only ever sees present values:
 ```rust
 let mut domain = Domain::new();
 domain.unit(UnitDef { name: "usd".into(), prefix: Some("$".into()), suffix: None, places: 2 })?;
-domain.builtin("brackets", check_brackets, eval_brackets);
+domain.builtin("slcsp", check_slcsp, eval_slcsp); // a premium looked up from a rate file
 ```
 
 ```lisp
-(def line16/tax (round $1 (brackets line15/taxable-income tax-schedule)))
+(def benchmark (slcsp zip-code household-size))
 ```
 
 The main entry points on `factlet::lisp::Program`:

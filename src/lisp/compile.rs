@@ -206,6 +206,7 @@ const RESERVED: &[&str] = &[
     "nth",
     "sum-list",
     "map-list",
+    "brackets",
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1215,6 +1216,7 @@ impl<'a> Compiler<'a> {
             "year" => Some(Op::Year),
             "month" => Some(Op::Month),
             "day" => Some(Op::Day),
+            "brackets" => Some(Op::Brackets),
             _ => None,
         };
         if let Some(op) = op {
@@ -1529,6 +1531,9 @@ impl<'a> Compiler<'a> {
                 );
             }
             return Ok(Type::Bool);
+        }
+        if op == Op::Brackets {
+            return brackets_type(types, span);
         }
         let mut units = Vec::new();
         for (t, a) in types.iter().zip(args) {
@@ -2141,4 +2146,23 @@ impl<'a> Compiler<'a> {
         );
         self.record(rounds, Some(Type::Num(None)));
     }
+}
+
+/// `(brackets amount [rate edge … rate])`: plain-number rates between edges
+/// in the amount's unit, ending with a rate. It's in the amount's unit.
+fn brackets_type(types: &[Type], span: Span) -> Result<Type, Diagnostic> {
+    let fail = |message: String| err(span, format!("`brackets`: {message}"));
+    let [Type::Num(unit), Type::List(schedule)] = types else {
+        return fail("expected (brackets amount [rate edge … rate])".into());
+    };
+    if schedule.len() % 2 == 0 {
+        return fail("the schedule must end with a rate".into());
+    }
+    for (i, t) in schedule.iter().enumerate() {
+        let want = Type::Num(if i % 2 == 0 { None } else { unit.clone() });
+        if !t.matches(&want) {
+            return fail(format!("schedule item {} is {t}, expected {want}", i + 1));
+        }
+    }
+    Ok(Type::Num(unit.clone()))
 }

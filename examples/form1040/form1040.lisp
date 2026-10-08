@@ -5,6 +5,7 @@
 ; the dollar (not the Tax Table midpoints under $100,000), and there are no
 ; credits, other income, or age/blindness additions.
 
+(unit usd :prefix "$" :places 2)
 (enum filing-status
   single married-joint married-separate head-of-household
   qualifying-surviving-spouse)

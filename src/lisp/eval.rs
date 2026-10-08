@@ -90,6 +90,7 @@ pub(crate) enum Op {
     Year,
     Month,
     Day,
+    Brackets,
 }
 
 #[derive(Clone)]
@@ -359,7 +360,38 @@ fn apply(op: Op, args: &[Value]) -> Value {
         Op::Year => int(date(0).year().into()),
         Op::Month => int(date(0).month().into()),
         Op::Day => int(date(0).day().into()),
+        Op::Brackets => {
+            let Value::List(schedule) = &args[1] else {
+                unreachable!("checked as a schedule")
+            };
+            result(brackets(num(&args[0]), schedule))
+        }
     }
+}
+
+/// Tax on `amount` under `[rate edge rate edge … rate]`: each rate applies
+/// to the part of the amount up to the edge after it, the last rate to
+/// everything above the last edge.
+fn brackets(amount: &Quantity, schedule: &[Value]) -> Result<Quantity, ValueError> {
+    let zero = Quantity {
+        num: crate::lisp::num::Num::ZERO,
+        unit: amount.unit.clone(),
+    };
+    let (mut tax, mut lower) = (zero.clone(), zero);
+    for pair in schedule.chunks(2) {
+        let upper = pair.get(1).map(num);
+        let top = match upper {
+            Some(u) => amount.min(u)?,
+            None => amount.clone(),
+        };
+        if top.compare(&lower)?.is_gt() {
+            tax = tax.add(&top.sub(&lower)?.mul(num(&pair[0]))?)?;
+        }
+        if let Some(u) = upper {
+            lower = u.clone();
+        }
+    }
+    Ok(tax)
 }
 
 fn aggregate(

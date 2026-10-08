@@ -102,3 +102,12 @@ fn explain_prints_the_derivation() {
     let (code, _, err) = factlet(&["explain", MAIN, "nope"]);
     assert_eq!((code, err.as_str()), (1, "unknown name `nope`\n"));
 }
+
+#[test]
+fn form1040_runs_on_the_default_domain() {
+    let program = "examples/form1040/form1040.lisp";
+    assert_eq!(factlet(&["check", program]).0, 0);
+    let (code, out, _) = factlet(&["test", program, "examples/form1040/tests.lisp"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.ends_with("4 passed, 0 failed\n"), "{out}");
+}

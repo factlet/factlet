@@ -1,17 +1,14 @@
 //! The draft's TY2025 scenarios, run against `examples/form1040/form1040.lisp`.
 
-#[path = "../examples/form1040/tax.rs"]
-mod tax;
-
 use factlet::Case;
 use factlet::case::Error;
 use factlet::lisp::test::run_tests;
-use factlet::lisp::{Program, Value, load};
+use factlet::lisp::{Domain, Program, Value, load};
 
 fn program() -> Program {
     load(
         include_str!("../examples/form1040/form1040.lisp"),
-        &tax::domain(),
+        &Domain::new(),
     )
     .unwrap_or_else(|errs| {
         let errs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
@@ -170,18 +167,6 @@ fn law_is_fixed_and_what_ifs_fork_the_case() {
     // $1,700 + 12% x ($34,375 - $17,000) = $3,785
     assert_eq!(get(&p, &mut hoh, "line16/tax"), "$3,785.00");
     assert_eq!(get(&p, &mut c, "line16/tax"), "$4,832.00");
-}
-
-#[test]
-fn bad_schedules_are_rejected_at_load() {
-    let errs = load(
-        "(def law/s [10% $100 12%])\n(def t (brackets $5 [10% 12%]))",
-        &tax::domain(),
-    )
-    .err()
-    .unwrap();
-    let errs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
-    assert_eq!(errs, ["2:8: `brackets`: the schedule must end with a rate"]);
 }
 
 #[test]

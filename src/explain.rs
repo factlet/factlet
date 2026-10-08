@@ -15,6 +15,8 @@ pub struct Node<V> {
     pub kind: Kind,
     /// `None` for collections.
     pub value: Option<V>,
+    /// A collection's member names, if answered.
+    pub members: Option<Vec<String>>,
     pub set: bool,
     pub children: Vec<Node<V>>,
     pub repeated: bool,
@@ -40,6 +42,12 @@ impl<V: Clone + PartialEq> Case<V> {
             name: self.name(fact),
             kind,
             value: (kind != Kind::Collection).then(|| self.get(fact)),
+            members: self.members(fact.id).ok().flatten().map(|ms| {
+                ms.iter()
+                    .filter_map(|&m| self.member_name(fact.id, m))
+                    .map(str::to_string)
+                    .collect()
+            }),
             set: self.is_set(fact),
             children: deps
                 .into_iter()
@@ -61,6 +69,10 @@ impl<V: fmt::Debug> Node<V> {
         write!(f, "{first}{}", self.name)?;
         if let Some(v) = &self.value {
             write!(f, " = {v:?}")?;
+        }
+        if let Some(members) = &self.members {
+            let names: Vec<_> = members.iter().map(|m| format!("#{m}")).collect();
+            write!(f, " = [{}]", names.join(", "))?;
         }
         if !self.set {
             f.write_str("  (unanswered)")?;

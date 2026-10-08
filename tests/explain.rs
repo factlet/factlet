@@ -48,3 +48,28 @@ d = 5
 "
     );
 }
+
+#[test]
+fn explain_lists_members() {
+    let mut b = Graph::<i64>::builder();
+    let w2s = b.collection("w2s");
+    let box1 = b.field_input(w2s, "box1Wages", 0);
+    let total = b.derived("total", move |cx| {
+        let members = cx.members(w2s);
+        members.iter().map(|&m| cx.get((box1, m))).sum()
+    });
+    let mut c = Case::new(b.build().unwrap());
+    let acme = c.add_member(w2s, "acme").unwrap();
+    c.add_member(w2s, "globex").unwrap();
+    c.set((box1, acme), 100).unwrap();
+
+    assert_eq!(
+        c.explain(total).to_string(),
+        "\
+total = 100
+├── w2s = [#acme, #globex]
+├── w2s/#acme/box1Wages = 100
+└── w2s/#globex/box1Wages = 0  (unanswered)
+"
+    );
+}

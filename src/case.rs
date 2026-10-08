@@ -3,6 +3,9 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
+/// What a removed member's facts report: changed after everything.
+const REMOVED: u64 = u64::MAX;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Stats {
     pub executed: u64,
@@ -78,7 +81,8 @@ struct Collection<V> {
     changed_at: u64,
     dependents: Vec<Fact>,
     /// Each member's name and fields, indexed by member.
-    rows: Vec<Row<V>>,
+    /// Indexed by member; `None` once removed.
+    rows: Vec<Option<Row<V>>>,
 }
 
 #[derive(Clone)]
@@ -165,7 +169,7 @@ impl<V: Clone + PartialEq> Case<V> {
         let c = self.collection_index(collection)?;
         let g = &*self.graph;
         let coll = &mut self.state.collections[c];
-        if coll.rows.iter().any(|(n, _)| &**n == name) {
+        if coll.rows.iter().flatten().any(|(n, _)| &**n == name) {
             return Err(Error::DuplicateMember {
                 collection: g.name(collection).to_string(),
                 name: name.to_string(),
@@ -173,7 +177,7 @@ impl<V: Clone + PartialEq> Case<V> {
         }
         let member = Member(u32::try_from(coll.rows.len()).expect("too many members"));
         let slots = g.collections[c].iter().map(|_| Slot::empty()).collect();
-        coll.rows.push((name.into(), slots));
+        coll.rows.push(Some((name.into(), slots)));
         let mut members = coll.members.as_deref().unwrap_or_default().to_vec();
         members.push(member);
         coll.members = Some(members.into());
@@ -181,6 +185,42 @@ impl<V: Clone + PartialEq> Case<V> {
         coll.changed_at = self.state.revision;
         self.state.mark_dependents(g, collection.into());
         Ok(member)
+    }
+
+    pub fn remove_member(&mut self, collection: usize, member: Member) -> Result<(), Error> {
+        let c = self.collection_index(collection)?;
+        if self.member_name(collection, member).is_none() {
+            let name = self.graph.name(collection);
+            return Err(Error::NoSuchMember(format!("{name}/#{}", member.0)));
+        }
+        let g = &*self.graph;
+        self.state.drop_row(g, c, member);
+        let coll = &mut self.state.collections[c];
+        let members = coll.members.iter().flat_map(|m| m.iter()).copied();
+        coll.members = Some(members.filter(|&m| m != member).collect());
+        self.state.revision += 1;
+        coll.changed_at = self.state.revision;
+        self.state.mark_dependents(g, collection.into());
+        Ok(())
+    }
+
+    /// Answer that a collection has no members, as opposed to not having asked.
+    pub fn set_empty(&mut self, collection: usize) -> Result<(), Error> {
+        let c = self.collection_index(collection)?;
+        let members = self.state.collections[c].members.clone();
+        if members.as_deref().is_some_and(<[Member]>::is_empty) {
+            return Ok(());
+        }
+        let g = &*self.graph;
+        for &m in members.iter().flat_map(|m| m.iter()) {
+            self.state.drop_row(g, c, m);
+        }
+        let coll = &mut self.state.collections[c];
+        coll.members = Some(Arc::new([]));
+        self.state.revision += 1;
+        coll.changed_at = self.state.revision;
+        self.state.mark_dependents(g, collection.into());
+        Ok(())
     }
 
     /// A collection's members, or `None` if unanswered.
@@ -191,7 +231,10 @@ impl<V: Clone + PartialEq> Case<V> {
 
     pub fn member_name(&self, collection: usize, member: Member) -> Option<&str> {
         let c = self.collection_index(collection).ok()?;
-        let (name, _) = self.state.collections[c].rows.get(member.0 as usize)?;
+        let (name, _) = self.state.collections[c]
+            .rows
+            .get(member.0 as usize)?
+            .as_ref()?;
         Some(name)
     }
 
@@ -201,9 +244,11 @@ impl<V: Clone + PartialEq> Case<V> {
         let g = &self.graph;
         match (g.scopes[fact.id], fact.member) {
             (Some(c), Some(m)) => {
-                let member = self.member_name(c, m).unwrap_or("?");
                 let field = &g.name(fact.id)[g.name(c).len() + 3..];
-                format!("{}/#{member}/{field}", g.name(c))
+                match self.member_name(c, m) {
+                    Some(member) => format!("{}/#{member}/{field}", g.name(c)),
+                    None => format!("{}/#{}(removed)/{field}", g.name(c), m.0),
+                }
             }
             _ => g.name(fact.id).to_string(),
         }
@@ -326,8 +371,13 @@ impl<V: Clone + PartialEq> Case<V> {
                 if g.is_fixed(d.id) {
                     continue;
                 }
+                let removed = d.member.is_some() && s.slot(g, d).is_none();
                 assert!(
-                    s.dependents(g, d).contains(&f),
+                    if removed {
+                        slot.changed
+                    } else {
+                        s.dependents(g, d).contains(&f)
+                    },
                     "{} reads {}, which doesn't list it",
                     self.name(f),
                     self.name(d)
@@ -354,7 +404,10 @@ impl<V: Clone + PartialEq> State<V> {
         }
         match (g.scopes[f.id], f.member) {
             (Some(c), Some(m)) => {
-                let (_, row) = self.collections[g.pos[c]].rows.get(m.0 as usize)?;
+                let (_, row) = self.collections[g.pos[c]]
+                    .rows
+                    .get(m.0 as usize)?
+                    .as_ref()?;
                 Some(&row[g.pos[f.id]])
             }
             _ => Some(&self.slots[f.id]),
@@ -367,7 +420,10 @@ impl<V: Clone + PartialEq> State<V> {
         }
         match (g.scopes[f.id], f.member) {
             (Some(c), Some(m)) => {
-                let (_, row) = self.collections[g.pos[c]].rows.get_mut(m.0 as usize)?;
+                let (_, row) = self.collections[g.pos[c]]
+                    .rows
+                    .get_mut(m.0 as usize)?
+                    .as_mut()?;
                 Some(&mut row[g.pos[f.id]])
             }
             _ => Some(&mut self.slots[f.id]),
@@ -394,6 +450,25 @@ impl<V: Clone + PartialEq> State<V> {
             Def::Input(_) => self.slot(g, f).is_some_and(|s| s.value.is_some()),
             _ => true,
         }
+    }
+
+    /// Dirty whatever read a member's facts, unhook its rules from what
+    /// they read, and drop its row.
+    fn drop_row(&mut self, g: &Graph<V>, c: usize, member: Member) {
+        for &field in g.collections[c].iter() {
+            let f = Fact::from((field, member));
+            self.mark_dependents(g, f);
+            let slot = self.slot_mut(g, f).expect("live");
+            let deps = std::mem::replace(&mut slot.deps, Arc::new([]));
+            for &d in deps.iter() {
+                if let Some(list) = self.dependents_mut(g, d)
+                    && let Some(p) = list.iter().position(|&x| x == f)
+                {
+                    list.swap_remove(p);
+                }
+            }
+        }
+        self.collections[c].rows[member.0 as usize] = None;
     }
 
     fn mark_dependents(&mut self, g: &Graph<V>, f: Fact) {
@@ -458,7 +533,7 @@ impl<V: Clone + PartialEq> State<V> {
             Def::Derived(_) => true,
         };
         let Some(slot) = self.slot(g, f) else {
-            panic!("{}: no such member", g.name(f.id));
+            return REMOVED;
         };
         if !rule || (slot.value.is_some() && !slot.changed) {
             return slot.changed_at;

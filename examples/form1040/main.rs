@@ -35,7 +35,7 @@ fn main() {
     program.set(&mut c, (box2, acme), "$6,000").unwrap();
     program.set(&mut c, id("taxable-interest"), "$0").unwrap();
 
-    println!("\n== Answered:\n{}", c.explain(refund));
+    println!("\n== Answered:\n{}", program.explain_fact(&mut c, refund));
 
     c.reset_stats();
     let side = c.add_member(w2s, "side-gig").unwrap();

@@ -60,12 +60,40 @@ impl<V: Clone + PartialEq> Case<V> {
 
 impl<V: fmt::Debug> fmt::Display for Explanation<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.root.render(f, "", "")
+        self.root.render(f, "", "", &|_| None)
+    }
+}
+
+impl<V: fmt::Debug> Explanation<V> {
+    /// The tree with a note after each fact that has one, such as its label
+    /// or the line of a form it fills: `line16/tax = 4832  ; Tax (line 16)`.
+    pub fn with_notes<'a>(
+        &'a self,
+        note: impl Fn(&Node<V>) -> Option<String> + 'a,
+    ) -> impl fmt::Display + 'a {
+        Notes { tree: self, note }
+    }
+}
+
+struct Notes<'a, V, F> {
+    tree: &'a Explanation<V>,
+    note: F,
+}
+
+impl<V: fmt::Debug, F: Fn(&Node<V>) -> Option<String>> fmt::Display for Notes<'_, V, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.tree.root.render(f, "", "", &self.note)
     }
 }
 
 impl<V: fmt::Debug> Node<V> {
-    fn render(&self, f: &mut fmt::Formatter<'_>, first: &str, rest: &str) -> fmt::Result {
+    fn render(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        first: &str,
+        rest: &str,
+        note: &dyn Fn(&Node<V>) -> Option<String>,
+    ) -> fmt::Result {
         write!(f, "{first}{}", self.name)?;
         if let Some(v) = &self.value {
             write!(f, " = {v:?}")?;
@@ -80,6 +108,9 @@ impl<V: fmt::Debug> Node<V> {
         if self.repeated {
             f.write_str("  (see above)")?;
         }
+        if let Some(note) = note(self) {
+            write!(f, "  ; {note}")?;
+        }
         writeln!(f)?;
         for (i, child) in self.children.iter().enumerate() {
             let last = i + 1 == self.children.len();
@@ -88,7 +119,12 @@ impl<V: fmt::Debug> Node<V> {
             } else {
                 ("├── ", "│   ")
             };
-            child.render(f, &format!("{rest}{branch}"), &format!("{rest}{indent}"))?;
+            child.render(
+                f,
+                &format!("{rest}{branch}"),
+                &format!("{rest}{indent}"),
+                note,
+            )?;
         }
         Ok(())
     }

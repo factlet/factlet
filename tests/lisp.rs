@@ -402,7 +402,7 @@ fn default_diagnostics() {
         ["2:25: expected a literal, found `b`"]
     );
     assert_eq!(
-        errors("(input a : usd :dflt $0)"),
-        ["1:1: expected (input name : type [:default value])"]
+        errors("(input a : usd :default)"),
+        ["1:1: expected (input name : type [:default value] [:key value…])"]
     );
 }

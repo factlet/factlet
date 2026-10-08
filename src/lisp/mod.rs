@@ -27,7 +27,7 @@ pub mod num;
 pub mod parser;
 pub mod value;
 
-pub use compile::Diagnostic;
+pub use compile::{Diagnostic, Meta};
 pub use domain::{Domain, Type};
 pub use value::Value;
 
@@ -35,6 +35,8 @@ use crate::case::Case;
 use crate::explain::Explanation;
 use crate::graph::{Fact, Graph};
 use crate::lisp::parser::{SExprKind, read};
+use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 /// A loaded program: its compiled graph, and the types of its facts.
@@ -43,6 +45,7 @@ pub struct Program {
     pub domain: Domain,
     types: Vec<Option<Type>>,
     defaulted: Vec<usize>,
+    meta: HashMap<usize, Meta>,
 }
 
 /// Parse, check and compile a program against `domain`.
@@ -82,6 +85,7 @@ impl From<compile::Compiled> for Program {
             domain: c.domain,
             types: c.types,
             defaulted: c.defaulted,
+            meta: c.meta,
         }
     }
 }
@@ -169,8 +173,35 @@ impl Program {
         Some(case.get(self.id(name)?))
     }
 
-    /// A global fact's derivation by name.
-    pub fn explain(&self, case: &mut Case<Value>, name: &str) -> Option<Explanation<Value>> {
-        Some(case.explain(self.id(name)?))
+    /// A fact's `:key value` notes, such as its label, line and citation.
+    pub fn meta(&self, id: usize) -> Option<&Meta> {
+        self.meta.get(&id)
+    }
+
+    /// A global fact's derivation by name. Printed, each fact with a label,
+    /// line or citation is noted: `line16/tax = $4,832.00  ; Tax (line 16)`.
+    pub fn explain(&self, case: &mut Case<Value>, name: &str) -> Option<Explained<'_>> {
+        Some(self.explain_fact(case, self.id(name)?))
+    }
+
+    /// Any fact's derivation, members' fields included.
+    pub fn explain_fact(&self, case: &mut Case<Value>, fact: impl Into<Fact>) -> Explained<'_> {
+        Explained {
+            tree: case.explain(fact),
+            program: self,
+        }
+    }
+}
+
+/// A derivation tree that prints with each fact's metadata.
+pub struct Explained<'p> {
+    pub tree: Explanation<Value>,
+    program: &'p Program,
+}
+
+impl fmt::Display for Explained<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let note = |node: &crate::explain::Node<Value>| self.program.meta(node.fact.id)?.summary();
+        write!(f, "{}", self.tree.with_notes(note))
     }
 }

@@ -39,6 +39,61 @@ impl fmt::Display for Diagnostic {
 
 impl std::error::Error for Diagnostic {}
 
+/// Notes on a fact for people and tools, written as `:key value` pairs on
+/// its declaration: `(def line16/tax :label "Tax" :line 16 :cite "IRC §1(j)" …)`.
+/// Any key is kept; `label`, `line` and `cite` are shown by `explain`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Meta {
+    entries: Vec<(Box<str>, Box<str>)>,
+}
+
+impl Meta {
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(k, _)| &**k == key)
+            .map(|(_, v)| &**v)
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.get("label")
+    }
+
+    pub fn line(&self) -> Option<&str> {
+        self.get("line")
+    }
+
+    pub fn cite(&self) -> Option<&str> {
+        self.get("cite")
+    }
+
+    /// Every entry, in the order written.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().map(|(k, v)| (&**k, &**v))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// `Tax (line 16, IRC §1(j))`, or `None` without a label, line or cite.
+    pub fn summary(&self) -> Option<String> {
+        let refs: Vec<String> = [
+            self.line().map(|l| format!("line {l}")),
+            self.cite().map(str::to_string),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        match (self.label(), refs.is_empty()) {
+            (None, true) => None,
+            (None, false) => Some(refs.join(", ")),
+            (Some(label), true) => Some(label.to_string()),
+            (Some(label), false) => Some(format!("{label} ({})", refs.join(", "))),
+        }
+    }
+}
+
 pub(crate) struct Compiled {
     pub graph: Arc<Graph<Value>>,
     pub domain: Domain,
@@ -46,6 +101,7 @@ pub(crate) struct Compiled {
     pub types: Vec<Option<Type>>,
     /// Inputs declared with a `:default`, by id.
     pub defaulted: Vec<usize>,
+    pub meta: HashMap<usize, Meta>,
 }
 
 enum DeclKind<'a> {
@@ -62,6 +118,7 @@ struct Decl<'a> {
     scope: Option<usize>,
     /// The module it was declared in, which its rule's names resolve in.
     module: usize,
+    meta: Meta,
 }
 
 /// A `defn`: typed parameters and a body, checked once.
@@ -179,6 +236,7 @@ struct Compiler<'a> {
     /// Fact types by id, filled as facts are added.
     fact_types: Vec<Option<Type>>,
     defaulted: Vec<usize>,
+    meta: HashMap<usize, Meta>,
     /// Definitions being compiled, for cycle reports.
     stack: Vec<usize>,
     errors: Vec<Diagnostic>,
@@ -202,6 +260,20 @@ fn sym(e: &SExpr) -> Option<&str> {
         SExprKind::Symbol(s) => Some(s),
         _ => None,
     }
+}
+
+/// Leading `:key value` pairs, and the items after them.
+fn options(items: &[SExpr]) -> (Vec<(&str, Span, &SExpr)>, &[SExpr]) {
+    let mut opts = Vec::new();
+    let mut k = 0;
+    while let (Some(key), Some(value)) = (items.get(k), items.get(k + 1)) {
+        let SExprKind::Keyword(name) = &key.kind else {
+            break;
+        };
+        opts.push((&**name, key.span, value));
+        k += 2;
+    }
+    (opts, &items[k..])
 }
 
 fn err<T>(span: Span, message: impl Into<String>) -> Result<T, Diagnostic> {
@@ -450,6 +522,7 @@ fn compile_loaded(
         builder: Graph::builder(),
         fact_types: Vec::new(),
         defaulted: Vec::new(),
+        meta: HashMap::new(),
         stack: Vec::new(),
         errors,
     };
@@ -499,6 +572,7 @@ fn compile_loaded(
         domain: c.domain,
         types: c.fact_types,
         defaulted: c.defaulted,
+        meta: c.meta,
     })
 }
 
@@ -610,7 +684,8 @@ impl<'a> Compiler<'a> {
                 None => err(span, "expected a name"),
             }
         };
-        let (kind, name, name_span) = match head {
+        let mut fields: &'a [SExpr] = &[];
+        let (kind, meta, name, name_span) = match head {
             Some("defn") if scope.is_none() => return self.declare_func(items, span, module, full),
             Some("fixpoint") if scope.is_none() => {
                 return self.declare_fixpoint(items, span, module);
@@ -619,16 +694,16 @@ impl<'a> Compiler<'a> {
             Some("defn") => return err(span, "functions must be defined at the top level"),
             Some("input") => {
                 let (name, name_span) = name_at(1)?;
-                let (ty, default) = match items.get(2..) {
-                    Some([colon, ty]) if sym(colon) == Some(":") => (ty, None),
-                    Some([colon, ty, key, value])
-                        if sym(colon) == Some(":")
-                            && matches!(&key.kind, SExprKind::Keyword(k) if &**k == "default") =>
-                    {
-                        (ty, Some(value))
-                    }
-                    _ => return err(span, "expected (input name : type [:default value])"),
+                let usage = "expected (input name : type [:default value] [:key value…])";
+                let ty = match items.get(2..4) {
+                    Some([colon, ty]) if sym(colon) == Some(":") => ty,
+                    _ => return err(span, usage),
                 };
+                let (opts, rest) = options(&items[4..]);
+                if !rest.is_empty() {
+                    return err(span, usage);
+                }
+                let (meta, default) = self.meta(&opts, "default")?;
                 let ty = self.type_expr(ty)?;
                 let default = match default {
                     None => Value::Missing,
@@ -643,18 +718,23 @@ impl<'a> Compiler<'a> {
                         v
                     }
                 };
-                (DeclKind::Input(ty, default), name, name_span)
+                (DeclKind::Input(ty, default), meta, name, name_span)
             }
             Some("def") => {
                 let (name, name_span) = name_at(1)?;
-                match items.get(2..) {
-                    Some([body]) => (DeclKind::Def(body), name, name_span),
-                    _ => return err(span, "expected (def name expression)"),
-                }
+                let (opts, rest) = options(items.get(2..).unwrap_or_default());
+                let [body] = rest else {
+                    return err(span, "expected (def name [:key value…] expression)");
+                };
+                let (meta, _) = self.meta(&opts, "")?;
+                (DeclKind::Def(body), meta, name, name_span)
             }
             Some("collection") if scope.is_none() => {
                 let (name, name_span) = name_at(1)?;
-                (DeclKind::Collection, name, name_span)
+                let (opts, rest) = options(items.get(2..).unwrap_or_default());
+                fields = rest;
+                let (meta, _) = self.meta(&opts, "")?;
+                (DeclKind::Collection, meta, name, name_span)
             }
             Some("collection") => return err(span, "collections can't be nested"),
             _ => {
@@ -680,11 +760,12 @@ impl<'a> Compiler<'a> {
             kind,
             scope,
             module,
+            meta,
         });
         self.state.push(State::Todo);
         self.types.push(Type::Unknown);
         if is_collection {
-            for field in &items[2..] {
+            for field in fields {
                 if let Err(e) = self.declare(field, Some(i), module, None) {
                     self.errors.push(e);
                 }
@@ -823,6 +904,42 @@ impl<'a> Compiler<'a> {
         Ok((Expr::Apply(body, exprs), ty))
     }
 
+    /// Metadata from `:key value` options, and the value of `special`
+    /// (such as an input's `:default`) if given.
+    fn meta(
+        &self,
+        opts: &[(&'a str, Span, &'a SExpr)],
+        special: &str,
+    ) -> Result<(Meta, Option<&'a SExpr>), Diagnostic> {
+        let mut meta = Meta::default();
+        let mut special_value = None;
+        for (i, &(key, span, value)) in opts.iter().enumerate() {
+            if opts[..i].iter().any(|(k, _, _)| *k == key) {
+                return err(span, format!("`:{key}` given twice"));
+            }
+            if key == special {
+                special_value = Some(value);
+                continue;
+            }
+            let text = match &value.kind {
+                SExprKind::Str(s) => s.to_string(),
+                SExprKind::Number(_) | SExprKind::Symbol(_) | SExprKind::Date(_) => {
+                    value.to_string()
+                }
+                _ => return err(value.span, format!("`:{key}` takes text, found `{value}`")),
+            };
+            meta.entries.push((key.into(), text.into()));
+        }
+        Ok((meta, special_value))
+    }
+
+    /// Keep declaration `i`'s metadata under its fact's id.
+    fn keep_meta(&mut self, i: usize, id: usize) {
+        if !self.decls[i].meta.is_empty() {
+            self.meta.insert(id, self.decls[i].meta.clone());
+        }
+    }
+
     fn record(&mut self, id: usize, ty: Option<Type>) {
         if self.fact_types.len() <= id {
             self.fact_types.resize(id + 1, None);
@@ -857,6 +974,7 @@ impl<'a> Compiler<'a> {
         }
         self.state[i] = State::Done(id);
         self.record(id, ty);
+        self.keep_meta(i, id);
     }
 
     /// Compile a definition and everything it reads, then add it.
@@ -905,6 +1023,7 @@ impl<'a> Compiler<'a> {
         self.types[i] = ty.clone();
         self.state[i] = State::Done(id);
         self.record(id, Some(ty));
+        self.keep_meta(i, id);
         Some(id)
     }
 
@@ -2014,6 +2133,7 @@ impl<'a> Compiler<'a> {
             self.types[m] = types[slot].clone();
             self.state[m] = State::Done(id);
             self.record(id, Some(types[slot].clone()));
+            self.keep_meta(m, id);
         }
         let rounds = self.builder.derived(
             &format!("fixpoint/{first}/rounds"),

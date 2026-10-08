@@ -1,4 +1,5 @@
 pub mod case;
+pub mod explain;
 pub mod graph;
 
 pub use case::Case;

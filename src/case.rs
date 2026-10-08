@@ -7,6 +7,7 @@ pub struct Stats {
     pub executed: u64,
     pub marked_green: u64,
     pub backdated: u64,
+    pub dirtied: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +26,8 @@ struct Slot<V> {
     changed_at: u64,
     verified_at: u64,
     deps: Arc<[usize]>,
+    dependents: Vec<usize>,
+    dirty: bool,
 }
 
 struct State<V> {
@@ -47,6 +50,8 @@ impl<V: Clone + PartialEq> Case<V> {
             changed_at: 0,
             verified_at: 0,
             deps: Arc::new([]),
+            dependents: Vec::new(),
+            dirty: false,
         };
         let slots = (0..graph.len()).map(|_| empty()).collect();
         let state = State {
@@ -80,6 +85,7 @@ impl<V: Clone + PartialEq> Case<V> {
             self.state.revision += 1;
             slot.value = new;
             slot.changed_at = self.state.revision;
+            self.state.mark_dependents(id);
         }
         Ok(())
     }
@@ -100,9 +106,83 @@ impl<V: Clone + PartialEq> Case<V> {
     pub fn reset_stats(&mut self) {
         self.state.stats = Stats::default();
     }
+
+    #[doc(hidden)]
+    pub fn check_invariants(&self) {
+        let (g, slots) = (&*self.graph, &self.state.slots);
+        for (f, slot) in slots.iter().enumerate() {
+            let mut unique = slot.dependents.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                slot.dependents.len(),
+                "{} lists a dependent twice",
+                g.name(f)
+            );
+            for &d in &slot.dependents {
+                assert!(
+                    slots[d].deps.contains(&f),
+                    "{} lists {}, which doesn't read it",
+                    g.name(f),
+                    g.name(d)
+                );
+            }
+            for &d in slot.deps.iter() {
+                if !matches!(g.defs[d], Def::Constant(_)) {
+                    assert!(
+                        slots[d].dependents.contains(&f),
+                        "{} reads {}, which doesn't list it",
+                        g.name(f),
+                        g.name(d)
+                    );
+                }
+                assert!(
+                    slot.dirty || !slots[d].dirty,
+                    "clean {} reads dirty {}",
+                    g.name(f),
+                    g.name(d)
+                );
+            }
+        }
+    }
 }
 
 impl<V: Clone + PartialEq> State<V> {
+    fn mark_dependents(&mut self, id: usize) {
+        let mut stack = self.slots[id].dependents.clone();
+        while let Some(d) = stack.pop() {
+            let slot = &mut self.slots[d];
+            if !slot.dirty {
+                slot.dirty = true;
+                stack.extend_from_slice(&slot.dependents);
+                self.stats.dirtied += 1;
+            }
+        }
+    }
+
+    /// Update reverse edges after `id`'s reads changed from `old` to `new`.
+    fn relink(&mut self, g: &Graph<V>, id: usize, old: &[usize], new: &[usize]) {
+        let sorted = |s: &[usize]| {
+            let mut v = s.to_vec();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let (old, new) = (sorted(old), sorted(new));
+        for &d in old.iter().filter(|d| new.binary_search(d).is_err()) {
+            let list = &mut self.slots[d].dependents;
+            if let Some(p) = list.iter().position(|&x| x == id) {
+                list.swap_remove(p);
+            }
+        }
+        for &d in new.iter().filter(|d| old.binary_search(d).is_err()) {
+            if !matches!(g.defs[d], Def::Constant(_)) {
+                self.slots[d].dependents.push(id);
+            }
+        }
+    }
+
     fn value<'a>(&'a self, g: &'a Graph<V>, id: usize) -> &'a V {
         match (&g.defs[id], &self.slots[id].value) {
             (Def::Constant(v), _) | (_, Some(v)) => v,
@@ -117,7 +197,7 @@ impl<V: Clone + PartialEq> State<V> {
             Def::Constant(_) => 0,
             Def::Input(_) => slot.changed_at,
             Def::Derived(_) if slot.value.is_none() => self.execute(g, id),
-            Def::Derived(_) if slot.verified_at == self.revision => slot.changed_at,
+            Def::Derived(_) if !slot.dirty => slot.changed_at,
             Def::Derived(_) => self
                 .try_mark_green(g, id)
                 .unwrap_or_else(|| self.execute(g, id)),
@@ -133,6 +213,7 @@ impl<V: Clone + PartialEq> State<V> {
         }
         let slot = &mut self.slots[id];
         slot.verified_at = self.revision;
+        slot.dirty = false;
         self.stats.marked_green += 1;
         Some(slot.changed_at)
     }
@@ -156,12 +237,16 @@ impl<V: Clone + PartialEq> State<V> {
             slot.changed_at = self.revision;
         }
         slot.verified_at = self.revision;
+        slot.dirty = false;
+        let changed_at = slot.changed_at;
         if *slot.deps != self.deps[start..] {
-            slot.deps = self.deps[start..].into();
+            let new: Arc<[usize]> = self.deps[start..].into();
+            let old = std::mem::replace(&mut slot.deps, new.clone());
+            self.relink(g, id, &old, &new);
         }
         self.deps.truncate(start);
         self.stats.backdated += backdated as u64;
-        slot.changed_at
+        changed_at
     }
 }
 

@@ -1,10 +1,12 @@
+use crate::case::Context;
 use crate::graph::{Builder, Graph};
+use crate::lisp::cycles;
 use crate::lisp::domain::{Domain, Type};
-use crate::lisp::eval::{Agg, Env, Expr, Op, eval};
+use crate::lisp::eval::{Agg, Env, Expr, Fixpoint, Op, eval};
 use crate::lisp::num::Num;
 use crate::lisp::parser::{SExpr, SExprKind, Span, read};
 use crate::lisp::value::{Quantity, UnitDef, Value, ValueError};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
@@ -56,11 +58,34 @@ enum FuncState {
     Done(Arc<Expr>, Type),
 }
 
+/// `(fixpoint name :start value :within tolerance :max n)`.
+struct FixDecl<'a> {
+    name: &'a str,
+    span: Span,
+    start: &'a SExpr,
+    within: Option<&'a SExpr>,
+    max: u32,
+}
+
+/// A cycle of definitions, iterated as one rule.
+struct Group {
+    /// Definitions in evaluation order.
+    members: Vec<usize>,
+    /// Its `fixpoint`s.
+    breaks: Vec<usize>,
+}
+
+/// The group being compiled: references to its members read guesses.
+struct Active {
+    slots: HashMap<usize, usize>,
+    types: Vec<Option<Type>>,
+}
+
 /// Names a `defn` can't take.
 const RESERVED: &[&str] = &[
     "+", "-", "*", "/", "min", "max", "abs", "round", "floor", "ceil", "=", "!=", "<", "<=", ">",
     ">=", "if", "cond", "and", "or", "not", "given?", "or-else", "let", "table", "sum", "count",
-    "any", "all", "min-of", "max-of", "true", "false",
+    "any", "all", "min-of", "max-of", "true", "false", "fixpoint",
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -76,6 +101,13 @@ struct Compiler<'a> {
     globals: HashMap<&'a str, usize>,
     fields: HashMap<(usize, &'a str), usize>,
     funcs: HashMap<&'a str, Func<'a>>,
+    fixpoints: Vec<FixDecl<'a>>,
+    groups: Vec<Group>,
+    /// Each declaration's group, if it's in a cycle.
+    group_of: Vec<Option<usize>>,
+    active: Option<Active>,
+    /// In a cycle already reported as not broken enough.
+    reported: Vec<bool>,
     state: Vec<State>,
     types: Vec<Type>,
     builder: Builder<Value>,
@@ -93,6 +125,9 @@ struct Scope<'a> {
     /// Collections whose fields are visible, innermost last: the field
     /// rule's own, then enclosing aggregates.
     collections: Vec<usize>,
+    /// Compiling a member of the active cycle, whose references to other
+    /// members read their current guesses.
+    in_group: bool,
 }
 
 fn sym(e: &SExpr) -> Option<&str> {
@@ -122,6 +157,11 @@ pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagno
         globals: HashMap::new(),
         fields: HashMap::new(),
         funcs: HashMap::new(),
+        fixpoints: Vec::new(),
+        groups: Vec::new(),
+        group_of: Vec::new(),
+        active: None,
+        reported: Vec::new(),
         state: Vec::new(),
         types: Vec::new(),
         builder: Graph::builder(),
@@ -140,6 +180,7 @@ pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagno
             c.errors.push(e);
         }
     }
+    c.plan_cycles();
     // Inputs and collections in source order, then rules as needed.
     for i in 0..c.decls.len() {
         c.add_answer(i);
@@ -161,6 +202,8 @@ pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagno
             },
         );
     }
+    // Drop the placeholder errors of cycles already reported.
+    c.errors.retain(|d| !d.message.is_empty());
     if !c.errors.is_empty() {
         c.errors.sort_by_key(|d| d.span.start);
         return Err(c.errors);
@@ -265,6 +308,8 @@ impl<'a> Compiler<'a> {
         };
         let (kind, name, name_span) = match head {
             Some("defn") if scope.is_none() => return self.declare_func(items, span),
+            Some("fixpoint") if scope.is_none() => return self.declare_fixpoint(items, span),
+            Some("fixpoint") => return err(span, "fixpoints must be declared at the top level"),
             Some("defn") => return err(span, "functions must be defined at the top level"),
             Some("input") => {
                 let (name, name_span) = name_at(1)?;
@@ -377,7 +422,7 @@ impl<'a> Compiler<'a> {
         }
         let mut scope = Scope {
             vars: func.params.clone(),
-            collections: Vec::new(),
+            ..Scope::default()
         };
         let body = func.body;
         let (body, ty) = self.expr(body, &mut scope).unwrap_or_else(|e| {
@@ -461,6 +506,13 @@ impl<'a> Compiler<'a> {
             State::Done(id) => return Some(id),
             State::Visiting => return None,
             State::Todo => {}
+        }
+        if let Some(g) = self.group_of[i] {
+            self.define_group(g);
+            return match self.state[i] {
+                State::Done(id) => Some(id),
+                _ => None,
+            };
         }
         let DeclKind::Def(body) = self.decls[i].kind else {
             unreachable!("answers are added first")
@@ -571,6 +623,13 @@ impl<'a> Compiler<'a> {
             }
         }
         if let Some(&i) = self.globals.get(s) {
+            if scope.in_group
+                && let Some(active) = &self.active
+                && let Some(&slot) = active.slots.get(&i)
+            {
+                let ty = active.types[slot].clone().unwrap_or(Type::Unknown);
+                return Ok((Expr::Guess(slot), ty));
+            }
             if matches!(self.decls[i].kind, DeclKind::Collection) {
                 return err(
                     span,
@@ -605,7 +664,27 @@ impl<'a> Compiler<'a> {
                 .map(|&d| self.decls[d].name)
                 .collect();
             path.push(self.decls[i].name);
-            return err(span, format!("cycle: {}", path.join(" -> ")));
+            let name = self.decls[i].name;
+            if self.reported[i] {
+                return err(span, "");
+            }
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|a| a.slots.contains_key(&i))
+            {
+                return err(
+                    span,
+                    format!("`{name}` is in a fixpoint cycle; pass it to functions as an argument"),
+                );
+            }
+            return err(
+                span,
+                format!(
+                    "cycle: {}; break it with (fixpoint {name} :start …)",
+                    path.join(" -> ")
+                ),
+            );
         }
         match self.define(i) {
             Some(id) => Ok((id, self.types[i].clone())),
@@ -1015,5 +1094,377 @@ impl<'a> Compiler<'a> {
             },
             ty,
         ))
+    }
+}
+
+fn rule(expr: Expr) -> impl Fn(&mut Context<'_, Value>) -> Value + Send + Sync + 'static {
+    let expr = Arc::new(expr);
+    move |cx| eval(&expr, cx, &mut Env::default())
+}
+
+/// What the cycle finder needs to avoid: names that aren't references.
+#[derive(Default)]
+struct Walk<'a> {
+    bound: Vec<&'a str>,
+    collections: Vec<usize>,
+    funcs: Vec<&'a str>,
+    fields: Vec<usize>,
+}
+
+impl<'a> Compiler<'a> {
+    fn declare_fixpoint(&mut self, items: &'a [SExpr], span: Span) -> Result<(), Diagnostic> {
+        let usage = "expected (fixpoint name :start value [:within tolerance] [:max rounds])";
+        let Some(name) = items.get(1).and_then(sym) else {
+            return err(span, usage);
+        };
+        let (mut start, mut within, mut max) = (None, None, 100);
+        for pair in items[2..].chunks(2) {
+            let [key, value] = pair else {
+                return err(span, usage);
+            };
+            match (&key.kind, &value.kind) {
+                (SExprKind::Keyword(k), _) if &**k == "start" => start = Some(value),
+                (SExprKind::Keyword(k), _) if &**k == "within" => within = Some(value),
+                (SExprKind::Keyword(k), SExprKind::Number(n))
+                    if &**k == "max" && n.scale == 0 && (1..=10_000).contains(&n.digits) =>
+                {
+                    max = n.digits as u32
+                }
+                _ => return err(key.span, format!("bad fixpoint option `{key} {value}`")),
+            }
+        }
+        let Some(start) = start else {
+            return err(span, format!("fixpoint `{name}` needs a :start"));
+        };
+        if self.fixpoints.iter().any(|f| f.name == name) {
+            return err(items[1].span, format!("fixpoint `{name}` declared twice"));
+        }
+        self.fixpoints.push(FixDecl {
+            name,
+            span: items[1].span,
+            start,
+            within,
+            max,
+        });
+        Ok(())
+    }
+
+    /// Find the cycles among global definitions and check each is broken
+    /// by its fixpoints.
+    fn plan_cycles(&mut self) {
+        let n = self.decls.len();
+        self.group_of = vec![None; n];
+        self.reported = vec![false; n];
+        let mut edges = vec![Vec::new(); n];
+        for (i, edge) in edges.iter_mut().enumerate() {
+            if let (DeclKind::Def(body), None) = (&self.decls[i].kind, self.decls[i].scope) {
+                let mut out = BTreeSet::new();
+                self.refs(body, &mut Walk::default(), &mut out);
+                *edge = out.into_iter().collect();
+            }
+        }
+        let mut claimed = vec![false; self.fixpoints.len()];
+        for component in cycles::cycles(&edges) {
+            let breaks: Vec<usize> = (0..self.fixpoints.len())
+                .filter(|&f| {
+                    let decl = self.globals.get(self.fixpoints[f].name);
+                    decl.is_some_and(|d| component.contains(d))
+                })
+                .collect();
+            if breaks.is_empty() {
+                continue; // reported as a plain cycle when compiled
+            }
+            for &b in &breaks {
+                claimed[b] = true;
+            }
+            let cut: Vec<usize> = breaks
+                .iter()
+                .map(|&b| self.globals[self.fixpoints[b].name])
+                .collect();
+            let Some(members) = cycles::order(&component, &edges, &cut) else {
+                let names: Vec<&str> = component.iter().map(|&d| self.decls[d].name).collect();
+                for &d in &component {
+                    self.reported[d] = true;
+                }
+                self.errors.push(Diagnostic {
+                    span: self.fixpoints[breaks[0]].span,
+                    message: format!(
+                        "the cycle through {} needs more fixpoints to break it",
+                        names.join(", ")
+                    ),
+                });
+                continue;
+            };
+            for &m in &members {
+                self.group_of[m] = Some(self.groups.len());
+            }
+            self.groups.push(Group { members, breaks });
+        }
+        for (f, claimed) in claimed.into_iter().enumerate() {
+            if claimed {
+                continue;
+            }
+            let FixDecl { name, span, .. } = self.fixpoints[f];
+            let message = match self.globals.get(name).map(|&d| &self.decls[d].kind) {
+                Some(DeclKind::Def(_)) => format!("`{name}` isn't in a cycle"),
+                _ => format!("fixpoint `{name}` names no def"),
+            };
+            self.errors.push(Diagnostic { span, message });
+        }
+    }
+
+    /// The global definitions `e` may read, directly or through the
+    /// functions it calls and the field rules it aggregates.
+    fn refs(&self, e: &'a SExpr, walk: &mut Walk<'a>, out: &mut BTreeSet<usize>) {
+        match &e.kind {
+            SExprKind::Symbol(s) => self.ref_name(s, walk, out),
+            SExprKind::Vector(items) => {
+                for item in items {
+                    self.refs(item, walk, out);
+                }
+            }
+            SExprKind::List(items) => {
+                let Some((head, args)) = items.split_first() else {
+                    return;
+                };
+                match sym(head) {
+                    Some("let") => {
+                        let depth = walk.bound.len();
+                        if let Some(SExprKind::Vector(pairs)) = args.first().map(|a| &a.kind) {
+                            for pair in pairs.chunks(2) {
+                                if let [name, value] = pair {
+                                    self.refs(value, walk, out);
+                                    walk.bound.extend(sym(name));
+                                }
+                            }
+                        }
+                        for a in args.iter().skip(1) {
+                            self.refs(a, walk, out);
+                        }
+                        walk.bound.truncate(depth);
+                    }
+                    Some("cond") => {
+                        for arm in args {
+                            if let SExprKind::List(parts) = &arm.kind {
+                                for part in parts.iter().filter(|p| sym(p) != Some("else")) {
+                                    self.refs(part, walk, out);
+                                }
+                            }
+                        }
+                    }
+                    Some("table") => {
+                        if let Some((key, arms)) = args.split_first() {
+                            self.refs(key, walk, out);
+                            for value in arms.chunks(2).filter_map(|p| p.get(1)) {
+                                self.refs(value, walk, out);
+                            }
+                        }
+                    }
+                    Some("sum" | "count" | "any" | "all" | "min-of" | "max-of") => {
+                        let c = args.first().and_then(sym).and_then(|s| self.globals.get(s));
+                        match c.copied() {
+                            Some(c) if matches!(self.decls[c].kind, DeclKind::Collection) => {
+                                walk.collections.push(c);
+                                for a in &args[1..] {
+                                    self.refs(a, walk, out);
+                                }
+                                walk.collections.pop();
+                            }
+                            _ => {
+                                for a in args {
+                                    self.refs(a, walk, out);
+                                }
+                            }
+                        }
+                    }
+                    Some(f) => {
+                        for a in args {
+                            self.refs(a, walk, out);
+                        }
+                        if let Some((&name, func)) = self.funcs.get_key_value(f)
+                            && !walk.funcs.contains(&name)
+                        {
+                            let mut inner = Walk {
+                                bound: func.params.iter().map(|(p, _)| *p).collect(),
+                                funcs: std::mem::take(&mut walk.funcs),
+                                fields: std::mem::take(&mut walk.fields),
+                                ..Walk::default()
+                            };
+                            inner.funcs.push(name);
+                            self.refs(func.body, &mut inner, out);
+                            inner.funcs.pop();
+                            walk.funcs = inner.funcs;
+                            walk.fields = inner.fields;
+                        }
+                    }
+                    None => {
+                        for item in items {
+                            self.refs(item, walk, out);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn ref_name(&self, s: &str, walk: &mut Walk<'a>, out: &mut BTreeSet<usize>) {
+        if walk.bound.contains(&s) {
+            return;
+        }
+        for &c in walk.collections.iter().rev() {
+            if let Some(&f) = self.fields.get(&(c, s)) {
+                if let DeclKind::Def(body) = self.decls[f].kind
+                    && !walk.fields.contains(&f)
+                {
+                    let mut inner = Walk {
+                        collections: vec![c],
+                        funcs: std::mem::take(&mut walk.funcs),
+                        fields: std::mem::take(&mut walk.fields),
+                        ..Walk::default()
+                    };
+                    inner.fields.push(f);
+                    self.refs(body, &mut inner, out);
+                    inner.fields.pop();
+                    walk.funcs = inner.funcs;
+                    walk.fields = inner.fields;
+                }
+                return;
+            }
+        }
+        if let Some(&d) = self.globals.get(s)
+            && matches!(self.decls[d].kind, DeclKind::Def(_))
+        {
+            out.insert(d);
+        }
+    }
+
+    /// A literal value for a fixpoint option.
+    fn literal(&mut self, e: &'a SExpr) -> Result<(Value, Type), Diagnostic> {
+        let ok = matches!(
+            &e.kind,
+            SExprKind::Number(_) | SExprKind::Str(_) | SExprKind::Quote(_)
+        ) || matches!(sym(e), Some("true" | "false"));
+        if !ok {
+            return err(e.span, format!("expected a literal, found `{e}`"));
+        }
+        match self.expr(e, &mut Scope::default())? {
+            (Expr::Lit(v), t) => Ok((v, t)),
+            _ => unreachable!("literals compile to literals"),
+        }
+    }
+
+    /// Compile a cycle as one rule that iterates it, plus a fact per member
+    /// that reads its converged value.
+    fn define_group(&mut self, g: usize) {
+        let members = self.groups[g].members.clone();
+        let breaks = self.groups[g].breaks.clone();
+        for &m in &members {
+            self.state[m] = State::Visiting;
+        }
+        let slots: HashMap<usize, usize> =
+            members.iter().enumerate().map(|(k, &m)| (m, k)).collect();
+        let mut types = vec![None; members.len()];
+        let mut starts = Vec::new();
+        let mut max = 0;
+        for &b in &breaks {
+            let (name, start, within) = {
+                let f = &self.fixpoints[b];
+                max = max.max(f.max);
+                (f.name, f.start, f.within)
+            };
+            let slot = slots[&self.globals[name]];
+            let (start, ty) = match self.literal(start) {
+                Ok(x) => x,
+                Err(e) => {
+                    self.errors.push(e);
+                    (Value::Missing, Type::Unknown)
+                }
+            };
+            let within = match within.map(|w| self.literal(w)) {
+                None => None,
+                Some(Ok((Value::Num(q), t))) if t.matches(&ty) => Some(q),
+                Some(Ok((_, t))) => {
+                    let span = within.unwrap().span;
+                    self.errors.push(Diagnostic {
+                        span,
+                        message: format!("`{name}` is {ty}, so :within must be too, not {t}"),
+                    });
+                    None
+                }
+                Some(Err(e)) => {
+                    self.errors.push(e);
+                    None
+                }
+            };
+            types[slot] = Some(ty);
+            starts.push((slot, start, within));
+        }
+
+        let outer = self.active.replace(Active { slots, types });
+        let mut order = Vec::new();
+        for (slot, &m) in members.iter().enumerate() {
+            let DeclKind::Def(body) = self.decls[m].kind else {
+                unreachable!("cycles are of definitions")
+            };
+            self.stack.push(m);
+            let mut scope = Scope {
+                in_group: true,
+                ..Scope::default()
+            };
+            let (expr, ty) = self.expr(body, &mut scope).unwrap_or_else(|e| {
+                self.errors.push(e);
+                (Expr::Lit(Value::Missing), Type::Unknown)
+            });
+            self.stack.pop();
+            let active = self.active.as_mut().expect("set above");
+            match &active.types[slot] {
+                Some(start) if !ty.matches(start) => {
+                    let name = self.decls[m].name;
+                    self.errors.push(Diagnostic {
+                        span: body.span,
+                        message: format!(
+                            "fixpoint `{name}` starts as {start} but is computed as {ty}"
+                        ),
+                    });
+                }
+                Some(_) => {}
+                None => active.types[slot] = Some(ty),
+            }
+            order.push(expr);
+        }
+        let active = std::mem::replace(&mut self.active, outer).expect("set above");
+        let types: Vec<Type> = active
+            .types
+            .into_iter()
+            .map(|t| t.unwrap_or(Type::Unknown))
+            .collect();
+
+        let first = self.fixpoints[breaks[0]].name;
+        let fixpoint = Fixpoint {
+            order,
+            breaks: starts,
+            max,
+        };
+        let hidden = self.builder.derived(
+            &format!("fixpoint/{first}"),
+            rule(Expr::Fixpoint(Arc::new(fixpoint))),
+        );
+        let mut list = types.clone();
+        list.push(Type::Num(None));
+        self.record(hidden, Some(Type::List(list.into())));
+        for (slot, &m) in members.iter().enumerate() {
+            let id = self
+                .builder
+                .derived(self.decls[m].name, rule(Expr::Nth(hidden, slot)));
+            self.types[m] = types[slot].clone();
+            self.state[m] = State::Done(id);
+            self.record(id, Some(types[slot].clone()));
+        }
+        let rounds = self.builder.derived(
+            &format!("fixpoint/{first}/rounds"),
+            rule(Expr::Nth(hidden, members.len())),
+        );
+        self.record(rounds, Some(Type::Num(None)));
     }
 }

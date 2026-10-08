@@ -233,7 +233,7 @@ fn diagnostics() {
     );
     assert_eq!(
         errors("(def a (+ b 1))\n(def b (+ c 1))\n(def c (+ a 1))"),
-        ["3:11: cycle: a -> b -> c -> a"]
+        ["3:11: cycle: a -> b -> c -> a; break it with (fixpoint a :start …)"]
     );
     assert_eq!(errors("(input a : money)"), ["1:12: unknown type `money`"]);
     assert_eq!(

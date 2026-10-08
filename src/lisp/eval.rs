@@ -41,7 +41,22 @@ pub(crate) enum Expr {
     Call(Arc<EvalFn>, Vec<Expr>),
     /// A `defn` call: the body sees only its arguments, as `Var(0..)`.
     Apply(Arc<Expr>, Vec<Expr>),
+    /// The current value of a cycle member, while iterating its cycle.
+    Guess(usize),
+    /// Iterate a cycle to a fixed point: a list of every member's value,
+    /// then the number of rounds.
+    Fixpoint(Arc<Fixpoint>),
+    /// Item `k` of a list-valued fact, such as a fixpoint's result.
+    Nth(usize, usize),
     List(Vec<Expr>),
+}
+
+pub(crate) struct Fixpoint {
+    /// Every member's rule, by slot, in evaluation order.
+    pub order: Vec<Expr>,
+    /// Break points: slot, first guess, and how close counts as converged.
+    pub breaks: Vec<(usize, Value, Option<Quantity>)>,
+    pub max: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,6 +96,8 @@ pub(crate) struct Env {
     vars: Vec<Value>,
     /// Members being visited by enclosing aggregates, innermost last.
     members: Vec<(usize, Member)>,
+    /// Cycle members' current values, by slot.
+    guesses: Vec<Value>,
 }
 
 fn num(v: &Value) -> &Quantity {
@@ -185,10 +202,16 @@ pub(crate) fn eval(e: &Expr, cx: &mut Context<'_, Value>, env: &mut Env) -> Valu
             let vars = args.iter().map(|a| eval(a, cx, env)).collect();
             let mut inner = Env {
                 vars,
-                members: Vec::new(),
+                ..Env::default()
             };
             eval(body, cx, &mut inner)
         }
+        Expr::Guess(slot) => env.guesses[*slot].clone(),
+        Expr::Fixpoint(f) => fixpoint(f, cx),
+        Expr::Nth(id, k) => match cx.get(*id) {
+            Value::List(items) => items[*k].clone(),
+            absent => absent,
+        },
         Expr::List(items) => {
             let values: Vec<Value> = items.iter().map(|a| eval(a, cx, env)).collect();
             absent(&values).unwrap_or_else(|| Value::List(values.into()))
@@ -327,4 +350,64 @@ fn aggregate(
             }
         }
     }
+}
+
+/// Gauss–Seidel, as the IRS's iterative worksheets run: start the break
+/// points at their guesses, evaluate every member in order (each seeing the
+/// latest values), and stop once no break point moves by more than its
+/// tolerance.
+fn fixpoint(f: &Fixpoint, cx: &mut Context<'_, Value>) -> Value {
+    let mut env = Env {
+        guesses: vec![Value::Missing; f.order.len()],
+        ..Env::default()
+    };
+    for (slot, start, _) in &f.breaks {
+        env.guesses[*slot] = start.clone();
+    }
+    for round in 1..=f.max {
+        let before: Vec<Value> = f
+            .breaks
+            .iter()
+            .map(|(s, _, _)| env.guesses[*s].clone())
+            .collect();
+        for (slot, rule) in f.order.iter().enumerate() {
+            env.guesses[slot] = eval(rule, cx, &mut env);
+        }
+        // A whole round is read first, so `unanswered` sees every input.
+        if let Some(absent) = absent(&env.guesses) {
+            return absent;
+        }
+        let settled = f
+            .breaks
+            .iter()
+            .zip(&before)
+            .all(
+                |((slot, _, within), old)| match (within, old, &env.guesses[*slot]) {
+                    (Some(tol), Value::Num(a), Value::Num(b)) => b
+                        .sub(a)
+                        .ok()
+                        .and_then(|d| d.num.abs())
+                        .is_some_and(|d| d <= tol.num),
+                    (_, old, new) => old == new,
+                },
+            );
+        if settled {
+            // Recompute the other members from the settled break points,
+            // as a return computes AGI from the final deduction.
+            for (slot, rule) in f.order.iter().enumerate() {
+                if !f.breaks.iter().any(|(b, _, _)| *b == slot) {
+                    env.guesses[slot] = eval(rule, cx, &mut env);
+                }
+            }
+            if let Some(absent) = absent(&env.guesses) {
+                return absent;
+            }
+            let mut out = std::mem::take(&mut env.guesses);
+            out.push(Value::Num(Quantity::plain(crate::lisp::num::Num::int(
+                round.into(),
+            ))));
+            return Value::List(out.into());
+        }
+    }
+    Value::Error(format!("no convergence after {} rounds", f.max).into())
 }

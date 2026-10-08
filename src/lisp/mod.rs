@@ -19,6 +19,7 @@
 //! ```
 
 mod compile;
+mod cycles;
 pub mod domain;
 mod eval;
 pub mod num;

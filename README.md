@@ -64,6 +64,34 @@ interview, an explanation and a what-if:
 cargo run --example form1040
 ```
 
+## Command line
+
+The `factlet` command checks, tests and runs programs without writing Rust.
+It's behind the `cli` feature, so the library itself has no dependencies:
+
+```sh
+cargo install factlet --features cli
+
+factlet check main.lisp                       # report every load error
+factlet test main.lisp tests/                 # run (test …) forms (§7)
+factlet eval main.lisp --case case.lisp --set 'interest=$100' taxable-income
+factlet explain main.lisp --case case.lisp taxable-income
+```
+
+`eval` prints each fact's value, and for a missing one, the questions
+blocking it. `--set` answers a global input as written in source; a
+`--case` file answers anything with the scenario forms of §7. Includes are
+read relative to the main file.
+
+A program that needs its own units or built-in functions (§6) can ship
+the same command, built on its domain:
+
+```rust
+fn main() -> std::process::ExitCode {
+    factlet::cli::run(my_domain())
+}
+```
+
 ---
 
 # Language specification
@@ -510,6 +538,42 @@ The main entry points on `factlet::lisp::Program`:
 
 And on `Case`: `add_member`, `remove_member`, `set_empty`, `unset`, `fork`
 and `stats`.
+
+## 7. Tests
+
+Test files hold `(test "name" form …)` forms, run against a program by
+`factlet test` or `factlet::lisp::test::run_tests`:
+
+```lisp
+(test "single, one W-2"
+  (expect line34/refund ?)
+  (given filing-status 'single
+         taxable-interest $0)
+  (member w2s acme
+    (given box1-wages $58,000 box2-withheld $6,000)
+    (expect withheld-rate 10.34%))
+  (empty dependents)
+  (expect line15/taxable-income $42,250
+          line16/tax $4,832))
+```
+
+| Form                          | Does                                                  |
+| ----------------------------- | ----------------------------------------------------- |
+| `(given name value …)`        | Answers inputs, checking their types                  |
+| `(member c name form …)`      | Adds a member to collection `c`; inside, names are its fields |
+| `(empty c …)`                 | Answers that a collection has no members              |
+| `(expect name value …)`       | Checks facts' values; `?` expects Missing             |
+| `(expect-error name …)`       | Checks that facts are Errors                          |
+
+Each test starts from an unanswered case and runs its forms in order, so
+it can expect, change an answer and expect again. Values are compared
+exactly: `$42,250` matches `$42,250.00`. A failure is reported at the
+expected value, as `tests/w2.lisp:9:30: line16/tax: expected $4,832.00, got
+$4,831.00`.
+
+A `--case` file for `eval` and `explain` (or
+`factlet::lisp::test::scenario`) holds the same `given`, `member` and
+`empty` forms, at the top level.
 
 ## License
 

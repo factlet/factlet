@@ -5,6 +5,7 @@ mod tax;
 
 use factlet::Case;
 use factlet::case::Error;
+use factlet::lisp::test::run_tests;
 use factlet::lisp::{Program, Value, load};
 
 fn program() -> Program {
@@ -181,4 +182,19 @@ fn bad_schedules_are_rejected_at_load() {
     .unwrap();
     let errs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
     assert_eq!(errs, ["2:8: `brackets`: the schedule must end with a rate"]);
+}
+
+#[test]
+fn lisp_tests_pass() {
+    let p = program();
+    let results = run_tests(
+        &p,
+        "tests.lisp",
+        include_str!("../examples/form1040/tests.lisp"),
+    )
+    .unwrap_or_else(|errs| panic!("{errs:?}"));
+    assert_eq!(results.len(), 4);
+    for r in results {
+        assert!(r.passed(), "{}: {:?}", r.name, r.failures);
+    }
 }

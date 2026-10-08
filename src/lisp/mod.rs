@@ -25,6 +25,7 @@ pub mod domain;
 mod eval;
 pub mod num;
 pub mod parser;
+pub mod test;
 pub mod value;
 
 pub use compile::{Diagnostic, Meta};
@@ -158,8 +159,19 @@ impl Program {
         fact: impl Into<Fact>,
         src: &str,
     ) -> Result<(), String> {
-        let fact = fact.into();
         let value = self.value(src)?;
+        self.assign(case, fact.into(), value, src)
+    }
+
+    /// Answer an input with a parsed value, checking its type; `src` is how
+    /// the value was written, for the error.
+    fn assign(
+        &self,
+        case: &mut Case<Value>,
+        fact: Fact,
+        value: Value,
+        src: &str,
+    ) -> Result<(), String> {
         let want = self.ty(fact.id).ok_or("not an input")?;
         let got = Type::of(&value).expect("parsed values are present");
         if !got.matches(want) {

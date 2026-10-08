@@ -48,6 +48,12 @@ pub(crate) enum Expr {
     Fixpoint(Arc<Fixpoint>),
     /// Item `k` of a list-valued fact, such as a fixpoint's result.
     Nth(usize, usize),
+    /// `(nth list k)`.
+    Index(Box<[Expr; 2]>),
+    /// `(sum-list xs)`, with the zero of its unit.
+    SumList(Box<Expr>, Value),
+    /// `(map-list f xs …)`: a function body applied element by element.
+    MapList(Arc<Expr>, Vec<Expr>),
     List(Vec<Expr>),
 }
 
@@ -78,6 +84,12 @@ pub(crate) enum Op {
     Le,
     Gt,
     Ge,
+    AgeOn,
+    MonthsBetween,
+    DaysBetween,
+    Year,
+    Month,
+    Day,
 }
 
 #[derive(Clone)]
@@ -212,6 +224,55 @@ pub(crate) fn eval(e: &Expr, cx: &mut Context<'_, Value>, env: &mut Env) -> Valu
             Value::List(items) => items[*k].clone(),
             absent => absent,
         },
+        Expr::Index(pair) => {
+            let values = [eval(&pair[0], cx, env), eval(&pair[1], cx, env)];
+            if let Some(absent) = absent(&values) {
+                return absent;
+            }
+            let (Value::List(items), Value::Num(k)) = (&values[0], &values[1]) else {
+                unreachable!("checked")
+            };
+            let index = (k.num.denom() == 1)
+                .then(|| usize::try_from(k.num.numer()).ok())
+                .flatten()
+                .filter(|&i| i < items.len());
+            match index {
+                Some(i) => items[i].clone(),
+                None => Value::Error(format!("index {} is out of range", k.num).into()),
+            }
+        }
+        Expr::SumList(xs, zero) => match eval(xs, cx, env) {
+            Value::List(items) => absent(&items).unwrap_or_else(|| {
+                let mut all = vec![zero.clone()];
+                all.extend(items.iter().cloned());
+                apply(Op::Add, &all)
+            }),
+            absent => absent,
+        },
+        Expr::MapList(body, lists) => {
+            let values: Vec<Value> = lists.iter().map(|l| eval(l, cx, env)).collect();
+            if let Some(absent) = absent(&values) {
+                return absent;
+            }
+            let lists: Vec<&[Value]> = values
+                .iter()
+                .map(|v| match v {
+                    Value::List(items) => &items[..],
+                    _ => unreachable!("checked"),
+                })
+                .collect();
+            let n = lists.first().map_or(0, |l| l.len());
+            let out: Vec<Value> = (0..n)
+                .map(|i| {
+                    let mut inner = Env {
+                        vars: lists.iter().map(|l| l[i].clone()).collect(),
+                        ..Env::default()
+                    };
+                    eval(body, cx, &mut inner)
+                })
+                .collect();
+            Value::List(out.into())
+        }
         Expr::List(items) => {
             let values: Vec<Value> = items.iter().map(|a| eval(a, cx, env)).collect();
             absent(&values).unwrap_or_else(|| Value::List(values.into()))
@@ -239,10 +300,18 @@ fn kleene(items: &[Expr], stop: bool, cx: &mut Context<'_, Value>, env: &mut Env
 }
 
 fn apply(op: Op, args: &[Value]) -> Value {
-    let cmp = |want: fn(Ordering) -> bool| match num(&args[0]).compare(num(&args[1])) {
-        Ok(o) => Value::Bool(want(o)),
-        Err(e) => Value::Error(e.to_string().into()),
+    let cmp = |want: fn(Ordering) -> bool| match (&args[0], &args[1]) {
+        (Value::Date(a), Value::Date(b)) => Value::Bool(want(a.cmp(b))),
+        _ => match num(&args[0]).compare(num(&args[1])) {
+            Ok(o) => Value::Bool(want(o)),
+            Err(e) => Value::Error(e.to_string().into()),
+        },
     };
+    let date = |i: usize| match &args[i] {
+        Value::Date(d) => *d,
+        other => unreachable!("checked as a date, got {other}"),
+    };
+    let int = |n: i64| Value::Num(Quantity::plain(crate::lisp::num::Num::int(n.into())));
     let fold = |f: fn(&Quantity, &Quantity) -> Result<Quantity, ValueError>| {
         let mut acc = num(&args[0]).clone();
         for a in &args[1..] {
@@ -284,6 +353,12 @@ fn apply(op: Op, args: &[Value]) -> Value {
         Op::Le => cmp(Ordering::is_le),
         Op::Gt => cmp(Ordering::is_gt),
         Op::Ge => cmp(Ordering::is_ge),
+        Op::AgeOn => int(date(0).age_on(date(1))),
+        Op::MonthsBetween => int(date(0).months_until(date(1))),
+        Op::DaysBetween => int(date(1).days() - date(0).days()),
+        Op::Year => int(date(0).year().into()),
+        Op::Month => int(date(0).month().into()),
+        Op::Day => int(date(0).day().into()),
     }
 }
 

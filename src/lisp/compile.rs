@@ -106,9 +106,49 @@ struct Active {
 
 /// Names a `defn` can't take.
 const RESERVED: &[&str] = &[
-    "+", "-", "*", "/", "min", "max", "abs", "round", "floor", "ceil", "=", "!=", "<", "<=", ">",
-    ">=", "if", "cond", "and", "or", "not", "given?", "or-else", "let", "table", "sum", "count",
-    "any", "all", "min-of", "max-of", "true", "false", "fixpoint",
+    "+",
+    "-",
+    "*",
+    "/",
+    "min",
+    "max",
+    "abs",
+    "round",
+    "floor",
+    "ceil",
+    "=",
+    "!=",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "if",
+    "cond",
+    "and",
+    "or",
+    "not",
+    "given?",
+    "or-else",
+    "let",
+    "table",
+    "sum",
+    "count",
+    "any",
+    "all",
+    "min-of",
+    "max-of",
+    "true",
+    "false",
+    "fixpoint",
+    "age-on",
+    "months-between",
+    "days-between",
+    "year",
+    "month",
+    "day",
+    "nth",
+    "sum-list",
+    "map-list",
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -658,6 +698,19 @@ impl<'a> Compiler<'a> {
     fn type_expr(&self, e: &SExpr) -> Result<Type, Diagnostic> {
         match &e.kind {
             SExprKind::Symbol(t) => self.domain.ty(t).ok_or(()),
+            SExprKind::Vector(items)
+                if matches!(&items[..], [_, n] if matches!(&n.kind, SExprKind::Number(_))) =>
+            {
+                let SExprKind::Number(n) = &items[1].kind else {
+                    unreachable!()
+                };
+                let plain = n.scale == 0 && n.prefix.is_none() && n.suffix.is_none();
+                if !plain || !(1..=1_000).contains(&n.digits) {
+                    return err(items[1].span, format!("expected a list length, found `{}`", items[1]));
+                }
+                let t = self.type_expr(&items[0])?;
+                Ok(Type::List(vec![t; n.digits as usize].into()))
+            }
             SExprKind::Vector(items) => items
                 .iter()
                 .map(|t| self.type_expr(t))
@@ -864,6 +917,7 @@ impl<'a> Compiler<'a> {
                 Ok((Expr::Lit(Value::Num(q)), ty))
             }
             SExprKind::Str(s) => Ok((Expr::Lit(Value::Str(s.as_ref().into())), Type::Str)),
+            SExprKind::Date(d) => Ok((Expr::Lit(Value::Date(*d)), Type::Date)),
             SExprKind::Quote(x) => {
                 let v = sym(x)
                     .ok_or_else(|| format!("expected a variant, found `{x}`"))
@@ -1036,6 +1090,12 @@ impl<'a> Compiler<'a> {
             "<=" => Some(Op::Le),
             ">" => Some(Op::Gt),
             ">=" => Some(Op::Ge),
+            "age-on" => Some(Op::AgeOn),
+            "months-between" => Some(Op::MonthsBetween),
+            "days-between" => Some(Op::DaysBetween),
+            "year" => Some(Op::Year),
+            "month" => Some(Op::Month),
+            "day" => Some(Op::Day),
             _ => None,
         };
         if let Some(op) = op {
@@ -1129,6 +1189,28 @@ impl<'a> Compiler<'a> {
                 Ok((Expr::Let(values, Box::new(body)), t))
             }
             "table" => self.table(args, span, scope),
+            "nth" => self.nth(args, span, scope),
+            "sum-list" => {
+                arity(1)?;
+                let (xs, t) = self.expr(&args[0], scope)?;
+                let unit = match (&t, t.element()) {
+                    (Type::Unknown, _) => return Ok((Expr::Lit(Value::Missing), Type::Unknown)),
+                    (Type::List(items), _) if items.is_empty() => None,
+                    (_, Some(Type::Num(u))) => u.clone(),
+                    _ => {
+                        return err(
+                            args[0].span,
+                            format!("`sum-list` needs a list of numbers, found {t}"),
+                        );
+                    }
+                };
+                let zero = Value::Num(Quantity {
+                    num: Num::ZERO,
+                    unit: unit.clone(),
+                });
+                Ok((Expr::SumList(Box::new(xs), zero), Type::Num(unit)))
+            }
+            "map-list" => self.map_list(args, span, scope),
             "sum" | "count" | "any" | "all" | "min-of" | "max-of" => {
                 self.aggregate(f, args, span, scope)
             }
@@ -1148,6 +1230,112 @@ impl<'a> Compiler<'a> {
                 Ok((Expr::Call(builtin.eval, exprs), ty))
             }
         }
+    }
+
+    /// `(nth xs k)`, from 0. A literal `k` can index a list of mixed types;
+    /// a computed one needs a list of one type.
+    fn nth(
+        &mut self,
+        args: &'a [SExpr],
+        span: Span,
+        scope: &mut Scope<'a>,
+    ) -> Result<(Expr, Type), Diagnostic> {
+        let [list, index] = args else {
+            return err(span, "`nth` takes 2 arguments");
+        };
+        let (xs, t) = self.expr(list, scope)?;
+        let items = match &t {
+            Type::List(items) => items.clone(),
+            Type::Unknown => return Ok((Expr::Lit(Value::Missing), Type::Unknown)),
+            _ => return err(list.span, format!("`nth` needs a list, found {t} `{list}`")),
+        };
+        if let SExprKind::Number(n) = &index.kind
+            && n.scale == 0
+            && n.prefix.is_none()
+            && n.suffix.is_none()
+        {
+            let Some(item) = usize::try_from(n.digits).ok().and_then(|k| items.get(k)) else {
+                return err(index.span, format!("{} is out of range for {t}", n.digits));
+            };
+            let k = Expr::Lit(Value::Num(Quantity::plain(Num::int(n.digits))));
+            return Ok((Expr::Index(Box::new([xs, k])), item.clone()));
+        }
+        let k = self.expect(index, scope, &Type::Num(None))?;
+        let Some(item) = t.element() else {
+            return err(
+                index.span,
+                format!("a computed index needs a list of one type, not {t}"),
+            );
+        };
+        let item = item.clone();
+        Ok((Expr::Index(Box::new([xs, k])), item))
+    }
+
+    /// `(map-list f xs ys …)`: `f` applied to the elements of the lists in
+    /// step, giving a list as long.
+    fn map_list(
+        &mut self,
+        args: &'a [SExpr],
+        span: Span,
+        scope: &mut Scope<'a>,
+    ) -> Result<(Expr, Type), Diagnostic> {
+        let Some((f, lists)) = args.split_first() else {
+            return err(span, "expected (map-list function list…)");
+        };
+        let Some(name) = sym(f).and_then(|s| self.func(scope.module, s)) else {
+            return err(f.span, format!("`{f}` is not a defn"));
+        };
+        let params = self.funcs[name].params.clone();
+        if lists.len() != params.len() {
+            let n = params.len();
+            return err(
+                span,
+                format!(
+                    "`{name}` takes {n} argument{}, so map it over {n} list{0}",
+                    if n == 1 { "" } else { "s" }
+                ),
+            );
+        }
+        let mut exprs = Vec::new();
+        let mut len = None;
+        for (list, (param, want)) in lists.iter().zip(&params) {
+            let (e, t) = self.expr(list, scope)?;
+            let n = match &t {
+                Type::List(items) => items.len(),
+                Type::Unknown => {
+                    exprs.push(e);
+                    continue;
+                }
+                _ => {
+                    return err(
+                        list.span,
+                        format!("`map-list` needs lists, found {t} `{list}`"),
+                    );
+                }
+            };
+            match t.element() {
+                Some(item) if item.matches(want) => {}
+                _ => {
+                    return err(
+                        list.span,
+                        format!(
+                            "`{name}` expects {want} for `{param}`, so its list must be [{want} n], not {t}"
+                        ),
+                    );
+                }
+            }
+            if len.is_some_and(|l| l != n) {
+                return err(
+                    list.span,
+                    format!("lists of different lengths: {} and {n}", len.unwrap()),
+                );
+            }
+            len = Some(n);
+            exprs.push(e);
+        }
+        let (body, ty) = self.func_body(name, span)?;
+        let ty = Type::List(vec![ty; len.unwrap_or(0)].into());
+        Ok((Expr::MapList(body, exprs), ty))
     }
 
     fn expect(
@@ -1173,7 +1361,7 @@ impl<'a> Compiler<'a> {
         span: Span,
     ) -> Result<Type, Diagnostic> {
         let (min, max) = match op {
-            Op::Neg | Op::Abs => (1, 1),
+            Op::Neg | Op::Abs | Op::Year | Op::Month | Op::Day => (1, 1),
             Op::Add | Op::Sub | Op::Mul | Op::Min | Op::Max => (1, usize::MAX),
             _ => (2, 2),
         };
@@ -1196,6 +1384,23 @@ impl<'a> Compiler<'a> {
                 Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => Type::Bool,
                 _ => Type::Unknown,
             });
+        }
+        if matches!(
+            op,
+            Op::AgeOn | Op::MonthsBetween | Op::DaysBetween | Op::Year | Op::Month | Op::Day
+        ) {
+            for (t, a) in types.iter().zip(args) {
+                if *t != Type::Date {
+                    return err(a.span, format!("`{f}` needs dates, found {t} `{a}`"));
+                }
+            }
+            return Ok(Type::Num(None));
+        }
+        if matches!(op, Op::Lt | Op::Le | Op::Gt | Op::Ge) && types[0] == Type::Date {
+            if types[1] != Type::Date {
+                return err(span, format!("`{f}` compares date with {}", types[1]));
+            }
+            return Ok(Type::Bool);
         }
         if matches!(op, Op::Eq | Op::Ne) {
             if types[0] != types[1] {
@@ -1241,7 +1446,7 @@ impl<'a> Compiler<'a> {
                 units[0].compare(&units[1]).map_err(mismatch)?;
                 Ok(Type::Bool)
             }
-            Op::Eq | Op::Ne => unreachable!(),
+            _ => unreachable!("handled above"),
         }
     }
 
@@ -1688,7 +1893,7 @@ impl<'a> Compiler<'a> {
     fn literal(&mut self, e: &'a SExpr) -> Result<(Value, Type), Diagnostic> {
         let ok = matches!(
             &e.kind,
-            SExprKind::Number(_) | SExprKind::Str(_) | SExprKind::Quote(_)
+            SExprKind::Number(_) | SExprKind::Str(_) | SExprKind::Quote(_) | SExprKind::Date(_)
         ) || matches!(sym(e), Some("true" | "false"));
         if !ok {
             return err(e.span, format!("expected a literal, found `{e}`"));

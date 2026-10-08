@@ -1,3 +1,4 @@
+use crate::lisp::date::Date;
 use std::fmt;
 
 /// A byte range in a source file, with the 1-based line and column it
@@ -28,6 +29,8 @@ pub enum SExprKind {
     Keyword(Box<str>),
     Str(Box<str>),
     Number(NumLit),
+    /// `2025-12-31`
+    Date(Date),
     /// `'x`
     Quote(Box<SExpr>),
 }
@@ -215,6 +218,11 @@ impl Parser<'_> {
         {
             return Ok(SExprKind::Keyword(kw.into()));
         }
+        match Date::parse(text) {
+            Some(Ok(d)) => return Ok(SExprKind::Date(d)),
+            Some(Err(message)) => return self.error(span, message),
+            None => {}
+        }
         match number(text) {
             Some(Ok(n)) => Ok(SExprKind::Number(n)),
             Some(Err(message)) => self.error(span, format!("bad number `{text}`: {message}")),
@@ -298,6 +306,7 @@ impl fmt::Display for SExpr {
             SExprKind::Keyword(k) => write!(f, ":{k}"),
             SExprKind::Str(s) => write!(f, "{s:?}"),
             SExprKind::Number(n) => write!(f, "{n}"),
+            SExprKind::Date(d) => write!(f, "{d}"),
             SExprKind::Quote(x) => write!(f, "'{x}"),
         }
     }

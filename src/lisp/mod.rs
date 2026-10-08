@@ -20,6 +20,7 @@
 
 mod compile;
 mod cycles;
+pub mod date;
 pub mod domain;
 mod eval;
 pub mod num;
@@ -121,9 +122,18 @@ impl Program {
         if forms.len() != 1 {
             return Err(format!("expected one value, found `{src}`"));
         }
-        let form = forms.remove(0);
+        self.value_of(&forms.remove(0))
+    }
+
+    fn value_of(&self, form: &parser::SExpr) -> Result<Value, String> {
         let variant = |name: &str| self.domain.variant(name).map(Value::Enum);
         match &form.kind {
+            SExprKind::Date(d) => Ok(Value::Date(*d)),
+            SExprKind::Vector(items) => {
+                let items: Result<Vec<Value>, String> =
+                    items.iter().map(|i| self.value_of(i)).collect();
+                Ok(Value::List(items?.into()))
+            }
             SExprKind::Number(lit) => Ok(Value::Num(self.domain.units.resolve(lit)?)),
             SExprKind::Str(s) => Ok(Value::Str(s.as_ref().into())),
             SExprKind::Symbol(s) if &**s == "true" => Ok(Value::Bool(true)),
@@ -133,7 +143,7 @@ impl Program {
                 SExprKind::Symbol(s) => variant(s),
                 _ => Err(format!("expected a variant, found `{x}`")),
             },
-            _ => Err(format!("expected a value, found `{src}`")),
+            _ => Err(format!("expected a value, found `{form}`")),
         }
     }
 

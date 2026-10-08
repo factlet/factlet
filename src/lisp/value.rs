@@ -1,3 +1,4 @@
+use crate::lisp::date::Date;
 use crate::lisp::num::Num;
 use crate::lisp::parser::NumLit;
 use std::cmp::Ordering;
@@ -331,6 +332,7 @@ pub enum Value {
     Bool(bool),
     Num(Quantity),
     Str(Arc<str>),
+    Date(Date),
     Enum(Variant),
     List(Arc<[Value]>),
 }
@@ -350,6 +352,7 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Num(q) => write!(f, "{q}"),
             Value::Str(s) => write!(f, "{s:?}"),
+            Value::Date(d) => write!(f, "{d}"),
             Value::Enum(v) => f.write_str(v.name()),
             Value::List(items) => {
                 f.write_str("[")?;

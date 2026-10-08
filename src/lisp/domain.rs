@@ -10,14 +10,27 @@ pub enum Type {
     Num(Option<Unit>),
     Bool,
     Str,
+    Date,
     Enum(Arc<EnumDef>),
-    /// A fixed-shape list, such as a bracket schedule.
+    /// A fixed-shape list, such as a bracket schedule; `[usd 12]` is twelve
+    /// `usd`s.
     List(Arc<[Type]>),
     /// After an error, so one mistake isn't reported again downstream.
     Unknown,
 }
 
 impl Type {
+    /// A list's element type, if every element has the same one.
+    pub fn element(&self) -> Option<&Type> {
+        match self {
+            Type::List(items) => {
+                let first = items.first()?;
+                items.iter().all(|t| t.matches(first)).then_some(first)
+            }
+            _ => None,
+        }
+    }
+
     /// Equal, or either is `Unknown`.
     pub fn matches(&self, o: &Type) -> bool {
         match (self, o) {
@@ -36,6 +49,7 @@ impl Type {
             Value::Bool(_) => Type::Bool,
             Value::Num(q) => Type::Num(q.unit.clone()),
             Value::Str(_) => Type::Str,
+            Value::Date(_) => Type::Date,
             Value::Enum(v) => Type::Enum(v.ty().clone()),
             Value::List(items) => Type::List(items.iter().map(Type::of).collect::<Option<_>>()?),
         })
@@ -49,7 +63,11 @@ impl fmt::Display for Type {
             Type::Num(Some(u)) => f.write_str(u.name()),
             Type::Bool => f.write_str("bool"),
             Type::Str => f.write_str("string"),
+            Type::Date => f.write_str("date"),
             Type::Enum(e) => f.write_str(&e.name),
+            Type::List(items) if items.len() > 1 && items.iter().all(|t| *t == items[0]) => {
+                write!(f, "[{} {}]", items[0], items.len())
+            }
             Type::List(items) => {
                 f.write_str("[")?;
                 for (i, t) in items.iter().enumerate() {
@@ -143,6 +161,7 @@ impl Domain {
             "number" => return Some(Type::Num(None)),
             "bool" => return Some(Type::Bool),
             "string" => return Some(Type::Str),
+            "date" => return Some(Type::Date),
             _ => {}
         }
         if let Some(u) = self.units.get(name) {

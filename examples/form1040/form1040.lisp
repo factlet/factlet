@@ -37,6 +37,9 @@
 
 ; ---- Lines ----
 
+; The excess of `a` over `b`, or zero: the form's "If zero or less, enter -0-".
+(defn excess [a : usd b : usd] (max $0 (- a b)))
+
 (def line1z/wages (sum w2s box1-wages))
 (def line11/agi (+ line1z/wages taxable-interest))
 (def line12/standard-deduction
@@ -44,8 +47,7 @@
     (single married-separate)                   law/std-deduction/single
     (married-joint qualifying-surviving-spouse) law/std-deduction/joint
     head-of-household                           law/std-deduction/hoh))
-(def line15/taxable-income
-  (max $0 (- line11/agi line12/standard-deduction)))
+(def line15/taxable-income (excess line11/agi line12/standard-deduction))
 (def tax-schedule
   (table filing-status
     single                                      law/brackets/single
@@ -54,5 +56,5 @@
     head-of-household                           law/brackets/hoh))
 (def line16/tax (round $1 (brackets line15/taxable-income tax-schedule)))
 (def line25a/withholding (sum w2s box2-withheld))
-(def line34/refund (max $0 (- line25a/withholding line16/tax)))
-(def line37/amount-owed (max $0 (- line16/tax line25a/withholding)))
+(def line34/refund (excess line25a/withholding line16/tax))
+(def line37/amount-owed (excess line16/tax line25a/withholding))

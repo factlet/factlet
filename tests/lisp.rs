@@ -269,3 +269,72 @@ fn diagnostics() {
         ["1:8: `cond` needs a final (else value)"]
     );
 }
+
+#[test]
+fn functions() {
+    let p = program(
+        "(defn at-least-zero [x : usd] (max $0 x))
+         (defn phase-out [amount : usd income : usd limit : usd rate : number]
+           (at-least-zero (- amount (* rate (at-least-zero (- income limit))))))
+         (input income : usd)
+         (collection kids (input age : number))
+         (defn credit-for [age : number] (if (< age 17) $2,000 $500))
+         (def credit (phase-out (sum kids (credit-for age)) income $200,000 5%))
+         (def law/limit (phase-out $1,000 $210,000 $200,000 5%))",
+    );
+    assert!(
+        p.graph.is_folded(p.id("law/limit").unwrap()),
+        "calls with law fold"
+    );
+
+    let mut c = p.case();
+    let kids = p.id("kids").unwrap();
+    let age = p.id("kids/*/age").unwrap();
+    let (a, b) = (
+        c.add_member(kids, "a").unwrap(),
+        c.add_member(kids, "b").unwrap(),
+    );
+    p.set(&mut c, (age, a), "5").unwrap();
+    p.set(&mut c, (age, b), "17").unwrap();
+    p.set(&mut c, p.id("income").unwrap(), "$220,000").unwrap();
+    assert_eq!(get(&p, &mut c, "credit"), "$1,500.00");
+    assert_eq!(get(&p, &mut c, "law/limit"), "$500.00");
+
+    p.set(&mut c, p.id("income").unwrap(), "$300,000").unwrap();
+    assert_eq!(get(&p, &mut c, "credit"), "$0.00");
+    c.check_invariants();
+}
+
+#[test]
+fn function_diagnostics() {
+    assert_eq!(
+        errors("(defn f [x : usd] (+ x 1))"),
+        ["1:19: `+` can't combine usd and a plain number"],
+        "checked once, even uncalled"
+    );
+    assert_eq!(
+        errors("(defn f [x : usd] x)\n(def a (f 1))"),
+        ["2:11: `f` expects usd for `x`, found number `1`"]
+    );
+    assert_eq!(
+        errors("(defn f [x : usd] x)\n(def a (f))"),
+        ["2:8: `f` takes 1 argument"]
+    );
+    assert_eq!(
+        errors("(defn f [x : number] (g x))\n(defn g [x : number] (f x))"),
+        ["2:22: recursive call to `f`"]
+    );
+    assert_eq!(
+        errors("(defn max [x : number] x)"),
+        ["1:7: `max` is already a function"]
+    );
+    assert_eq!(
+        errors("(defn f [x : dollars] x)"),
+        ["1:14: unknown type `dollars`"]
+    );
+    assert_eq!(
+        errors("(collection c (input v : usd))\n(defn f [] v)"),
+        ["2:12: `v` is a field of `c`; read it inside (sum c …) or a rule of `c`"],
+        "bodies see only their parameters and globals"
+    );
+}

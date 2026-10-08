@@ -39,6 +39,8 @@ pub(crate) enum Expr {
         body: Option<Box<Expr>>,
     },
     Call(Arc<EvalFn>, Vec<Expr>),
+    /// A `defn` call: the body sees only its arguments, as `Var(0..)`.
+    Apply(Arc<Expr>, Vec<Expr>),
     List(Vec<Expr>),
 }
 
@@ -177,6 +179,15 @@ pub(crate) fn eval(e: &Expr, cx: &mut Context<'_, Value>, env: &mut Env) -> Valu
         Expr::Call(f, args) => {
             let values: Vec<Value> = args.iter().map(|a| eval(a, cx, env)).collect();
             absent(&values).unwrap_or_else(|| f(&values))
+        }
+        Expr::Apply(body, args) => {
+            // Arguments are read before the call, even ones the body skips.
+            let vars = args.iter().map(|a| eval(a, cx, env)).collect();
+            let mut inner = Env {
+                vars,
+                members: Vec::new(),
+            };
+            eval(body, cx, &mut inner)
         }
         Expr::List(items) => {
             let values: Vec<Value> = items.iter().map(|a| eval(a, cx, env)).collect();

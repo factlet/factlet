@@ -43,6 +43,26 @@ struct Decl<'a> {
     scope: Option<usize>,
 }
 
+/// A `defn`: typed parameters and a body, checked once.
+struct Func<'a> {
+    params: Vec<(&'a str, Type)>,
+    body: &'a SExpr,
+    state: FuncState,
+}
+
+enum FuncState {
+    Todo,
+    Visiting,
+    Done(Arc<Expr>, Type),
+}
+
+/// Names a `defn` can't take.
+const RESERVED: &[&str] = &[
+    "+", "-", "*", "/", "min", "max", "abs", "round", "floor", "ceil", "=", "!=", "<", "<=", ">",
+    ">=", "if", "cond", "and", "or", "not", "given?", "or-else", "let", "table", "sum", "count",
+    "any", "all", "min-of", "max-of", "true", "false",
+];
+
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Todo,
@@ -55,6 +75,7 @@ struct Compiler<'a> {
     decls: Vec<Decl<'a>>,
     globals: HashMap<&'a str, usize>,
     fields: HashMap<(usize, &'a str), usize>,
+    funcs: HashMap<&'a str, Func<'a>>,
     state: Vec<State>,
     types: Vec<Type>,
     builder: Builder<Value>,
@@ -100,6 +121,7 @@ pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagno
         decls: Vec::new(),
         globals: HashMap::new(),
         fields: HashMap::new(),
+        funcs: HashMap::new(),
         state: Vec::new(),
         types: Vec::new(),
         builder: Graph::builder(),
@@ -124,6 +146,20 @@ pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagno
     }
     for i in 0..c.decls.len() {
         c.define(i);
+    }
+    // Check functions nothing calls, too.
+    let mut names: Vec<&str> = c.funcs.keys().copied().collect();
+    names.sort_unstable();
+    for name in names {
+        let _ = c.func_body(
+            name,
+            Span {
+                start: 0,
+                end: 0,
+                line: 1,
+                col: 1,
+            },
+        );
     }
     if !c.errors.is_empty() {
         c.errors.sort_by_key(|d| d.span.start);
@@ -228,16 +264,15 @@ impl<'a> Compiler<'a> {
             }
         };
         let (kind, name, name_span) = match head {
+            Some("defn") if scope.is_none() => return self.declare_func(items, span),
+            Some("defn") => return err(span, "functions must be defined at the top level"),
             Some("input") => {
                 let (name, name_span) = name_at(1)?;
                 let ty = match items.get(2..) {
                     Some([colon, ty]) if sym(colon) == Some(":") => ty,
                     _ => return err(span, "expected (input name : type)"),
                 };
-                let Some(t) = sym(ty).and_then(|t| self.domain.ty(t)) else {
-                    return err(ty.span, format!("unknown type `{ty}`"));
-                };
-                (DeclKind::Input(t), name, name_span)
+                (DeclKind::Input(self.type_expr(ty)?), name, name_span)
             }
             Some("def") => {
                 let (name, name_span) = name_at(1)?;
@@ -254,7 +289,7 @@ impl<'a> Compiler<'a> {
             _ => {
                 return err(
                     span,
-                    format!("expected input, def, collection, unit or enum, found `{form}`"),
+                    format!("expected input, def, defn, collection, unit or enum, found `{form}`"),
                 );
             }
         };
@@ -278,6 +313,114 @@ impl<'a> Compiler<'a> {
             }
         }
         Ok(())
+    }
+
+    /// A type: `usd`, `number`, `bool`, `string`, an enum, or a list of
+    /// types such as `[number usd number]`.
+    fn type_expr(&self, e: &SExpr) -> Result<Type, Diagnostic> {
+        match &e.kind {
+            SExprKind::Symbol(t) => self.domain.ty(t).ok_or(()),
+            SExprKind::Vector(items) => items
+                .iter()
+                .map(|t| self.type_expr(t))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|ts| Type::List(ts.into()))
+                .map_err(drop),
+            _ => Err(()),
+        }
+        .or_else(|()| err(e.span, format!("unknown type `{e}`")))
+    }
+
+    /// `(defn name [param : type …] body)`.
+    fn declare_func(&mut self, items: &'a [SExpr], span: Span) -> Result<(), Diagnostic> {
+        let usage = "expected (defn name [param : type …] body)";
+        let [_, name, params, body] = items else {
+            return err(span, usage);
+        };
+        let (Some(name_str), SExprKind::Vector(params)) = (sym(name), &params.kind) else {
+            return err(span, usage);
+        };
+        if RESERVED.contains(&name_str) || self.domain.get_builtin(name_str).is_some() {
+            return err(name.span, format!("`{name_str}` is already a function"));
+        }
+        if params.len() % 3 != 0 {
+            return err(span, usage);
+        }
+        let mut typed = Vec::new();
+        for triple in params.chunks(3) {
+            let (Some(p), Some(":")) = (sym(&triple[0]), sym(&triple[1])) else {
+                return err(triple[0].span, "expected `param : type`");
+            };
+            if typed.iter().any(|(q, _)| *q == p) {
+                return err(triple[0].span, format!("`{p}` is a parameter twice"));
+            }
+            typed.push((p, self.type_expr(&triple[2])?));
+        }
+        let func = Func {
+            params: typed,
+            body,
+            state: FuncState::Todo,
+        };
+        if self.funcs.insert(name_str, func).is_some() {
+            return err(name.span, format!("`{name_str}` is defined twice"));
+        }
+        Ok(())
+    }
+
+    /// A function's checked body and result type, checking it on first use.
+    fn func_body(&mut self, name: &'a str, span: Span) -> Result<(Arc<Expr>, Type), Diagnostic> {
+        let func = self.funcs.get_mut(name).expect("declared");
+        match &func.state {
+            FuncState::Done(body, ty) => return Ok((body.clone(), ty.clone())),
+            FuncState::Visiting => return err(span, format!("recursive call to `{name}`")),
+            FuncState::Todo => func.state = FuncState::Visiting,
+        }
+        let mut scope = Scope {
+            vars: func.params.clone(),
+            collections: Vec::new(),
+        };
+        let body = func.body;
+        let (body, ty) = self.expr(body, &mut scope).unwrap_or_else(|e| {
+            self.errors.push(e);
+            (Expr::Lit(Value::Missing), Type::Unknown)
+        });
+        let body = Arc::new(body);
+        let func = self.funcs.get_mut(name).expect("declared");
+        func.state = FuncState::Done(body.clone(), ty.clone());
+        Ok((body, ty))
+    }
+
+    fn apply(
+        &mut self,
+        name: &'a str,
+        args: &'a [SExpr],
+        span: Span,
+        scope: &mut Scope<'a>,
+    ) -> Result<(Expr, Type), Diagnostic> {
+        let params = self.funcs[name].params.clone();
+        if args.len() != params.len() {
+            let n = params.len();
+            return err(
+                span,
+                format!(
+                    "`{name}` takes {n} argument{}",
+                    if n == 1 { "" } else { "s" }
+                ),
+            );
+        }
+        let mut exprs = Vec::new();
+        for (arg, (param, want)) in args.iter().zip(&params) {
+            let (e, got) = self.expr(arg, scope)?;
+            if !got.matches(want) {
+                return err(
+                    arg.span,
+                    format!("`{name}` expects {want} for `{param}`, found {got} `{arg}`"),
+                );
+            }
+            exprs.push(e);
+        }
+        let (body, ty) = self.func_body(name, span)?;
+        Ok((Expr::Apply(body, exprs), ty))
     }
 
     fn record(&mut self, id: usize, ty: Option<Type>) {
@@ -600,6 +743,10 @@ impl<'a> Compiler<'a> {
             "table" => self.table(args, span, scope),
             "sum" | "count" | "any" | "all" | "min-of" | "max-of" => {
                 self.aggregate(f, args, span, scope)
+            }
+            _ if self.funcs.contains_key(f) => {
+                let name = *self.funcs.get_key_value(f).expect("checked").0;
+                self.apply(name, args, span, scope)
             }
             _ => {
                 let Some(builtin) = self.domain.get_builtin(f).cloned() else {

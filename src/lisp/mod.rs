@@ -41,6 +41,7 @@ pub struct Program {
     pub graph: Arc<Graph<Value>>,
     pub domain: Domain,
     types: Vec<Option<Type>>,
+    defaulted: Vec<usize>,
 }
 
 /// Parse, check and compile a program against `domain`.
@@ -50,6 +51,7 @@ pub fn load(src: &str, domain: &Domain) -> Result<Program, Vec<Diagnostic>> {
         graph: c.graph,
         domain: c.domain,
         types: c.types,
+        defaulted: c.defaulted,
     })
 }
 
@@ -62,6 +64,20 @@ impl Program {
     /// A fact's type; `None` for collections.
     pub fn ty(&self, id: usize) -> Option<&Type> {
         self.types.get(id)?.as_ref()
+    }
+
+    /// Whether an input was declared with a `:default`, so it needn't be
+    /// asked.
+    pub fn has_default(&self, id: usize) -> bool {
+        self.defaulted.contains(&id)
+    }
+
+    /// The questions blocking `fact`, as [`Case::unanswered`], less the
+    /// inputs that have a default: those read their default until answered.
+    pub fn unanswered(&self, case: &mut Case<Value>, fact: impl Into<Fact>) -> Vec<Fact> {
+        let mut questions = case.unanswered(fact);
+        questions.retain(|f| !self.has_default(f.id));
+        questions
     }
 
     pub fn case(&self) -> Case<Value> {

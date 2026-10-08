@@ -338,3 +338,71 @@ fn function_diagnostics() {
         "bodies see only their parameters and globals"
     );
 }
+
+#[test]
+fn input_defaults() {
+    let p = program(
+        "(enum status single joint)
+         (input wages : usd)
+         (input interest : usd :default $0)
+         (input status : status :default 'single)
+         (input blind : bool :default false)
+         (collection w2s
+           (input box1 : usd)
+           (input box12 : usd :default $0))
+         (def income (+ wages interest (sum w2s (+ box1 box12))))
+         (def extra (if blind $2,000 $0))
+         (def joint? (= status 'joint))",
+    );
+    let mut c = p.case();
+    let (wages, interest) = (p.id("wages").unwrap(), p.id("interest").unwrap());
+    let w2s = p.id("w2s").unwrap();
+    assert!(p.has_default(interest) && !p.has_default(wages));
+
+    // Defaults read until answered, and aren't asked.
+    assert_eq!(get(&p, &mut c, "extra"), "$0.00");
+    assert_eq!(get(&p, &mut c, "joint?"), "false");
+    let income = p.id("income").unwrap();
+    assert_eq!(p.unanswered(&mut c, income), vec![wages, w2s]);
+    assert_eq!(
+        c.unanswered(income).len(),
+        3,
+        "the engine still sees interest as unset"
+    );
+    assert!(!c.is_set(interest));
+
+    p.set(&mut c, wages, "$50,000").unwrap();
+    let acme = c.add_member(w2s, "acme").unwrap();
+    let names: Vec<String> = p
+        .unanswered(&mut c, income)
+        .into_iter()
+        .map(|f| c.name(f))
+        .collect();
+    assert_eq!(names, ["w2s/#acme/box1"]);
+    p.set(&mut c, (p.id("w2s/*/box1").unwrap(), acme), "$1,000")
+        .unwrap();
+    assert_eq!(get(&p, &mut c, "income"), "$51,000.00");
+
+    // An answer overrides the default; withdrawing it restores the default.
+    p.set(&mut c, interest, "$25").unwrap();
+    assert_eq!(get(&p, &mut c, "income"), "$51,025.00");
+    c.unset(interest).unwrap();
+    assert_eq!(get(&p, &mut c, "income"), "$51,000.00");
+    c.check_invariants();
+}
+
+#[test]
+fn default_diagnostics() {
+    assert_eq!(
+        errors("(input a : usd :default 5)"),
+        ["1:25: `a` is usd, so its default can't be number `5`"]
+    );
+    assert_eq!(
+        errors("(input b : usd)\n(input a : usd :default b)"),
+        ["2:25: expected a literal, found `b`"]
+    );
+    assert_eq!(
+        errors("(input a : usd :dflt $0)"),
+        ["1:1: expected (input name : type [:default value])"]
+    );
+}

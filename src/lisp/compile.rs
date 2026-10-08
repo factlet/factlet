@@ -30,10 +30,13 @@ pub(crate) struct Compiled {
     pub domain: Domain,
     /// Each fact's type, by id; `None` for collections.
     pub types: Vec<Option<Type>>,
+    /// Inputs declared with a `:default`, by id.
+    pub defaulted: Vec<usize>,
 }
 
 enum DeclKind<'a> {
-    Input(Type),
+    /// A type, and the value read until answered.
+    Input(Type, Value),
     Collection,
     Def(&'a SExpr),
 }
@@ -113,6 +116,7 @@ struct Compiler<'a> {
     builder: Builder<Value>,
     /// Fact types by id, filled as facts are added.
     fact_types: Vec<Option<Type>>,
+    defaulted: Vec<usize>,
     /// Definitions being compiled, for cycle reports.
     stack: Vec<usize>,
     errors: Vec<Diagnostic>,
@@ -166,6 +170,7 @@ pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagno
         types: Vec::new(),
         builder: Graph::builder(),
         fact_types: Vec::new(),
+        defaulted: Vec::new(),
         stack: Vec::new(),
         errors: Vec::new(),
     };
@@ -220,6 +225,7 @@ pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagno
         graph,
         domain: c.domain,
         types: c.fact_types,
+        defaulted: c.defaulted,
     })
 }
 
@@ -313,11 +319,31 @@ impl<'a> Compiler<'a> {
             Some("defn") => return err(span, "functions must be defined at the top level"),
             Some("input") => {
                 let (name, name_span) = name_at(1)?;
-                let ty = match items.get(2..) {
-                    Some([colon, ty]) if sym(colon) == Some(":") => ty,
-                    _ => return err(span, "expected (input name : type)"),
+                let (ty, default) = match items.get(2..) {
+                    Some([colon, ty]) if sym(colon) == Some(":") => (ty, None),
+                    Some([colon, ty, key, value])
+                        if sym(colon) == Some(":")
+                            && matches!(&key.kind, SExprKind::Keyword(k) if &**k == "default") =>
+                    {
+                        (ty, Some(value))
+                    }
+                    _ => return err(span, "expected (input name : type [:default value])"),
                 };
-                (DeclKind::Input(self.type_expr(ty)?), name, name_span)
+                let ty = self.type_expr(ty)?;
+                let default = match default {
+                    None => Value::Missing,
+                    Some(value) => {
+                        let (v, t) = self.literal(value)?;
+                        if !t.matches(&ty) {
+                            return err(
+                                value.span,
+                                format!("`{name}` is {ty}, so its default can't be {t} `{value}`"),
+                            );
+                        }
+                        v
+                    }
+                };
+                (DeclKind::Input(ty, default), name, name_span)
             }
             Some("def") => {
                 let (name, name_span) = name_at(1)?;
@@ -478,21 +504,25 @@ impl<'a> Compiler<'a> {
     fn add_answer(&mut self, i: usize) {
         let d = &self.decls[i];
         let (id, ty) = match (&d.kind, d.scope) {
-            (DeclKind::Input(t), None) => {
-                (self.builder.input(d.name, Value::Missing), Some(t.clone()))
+            (DeclKind::Input(t, default), None) => {
+                let id = self.builder.input(d.name, default.clone());
+                (id, Some(t.clone()))
             }
-            (DeclKind::Input(t), Some(c)) => {
+            (DeclKind::Input(t, default), Some(c)) => {
                 let State::Done(c) = self.state[c] else {
                     unreachable!("collections are added before their fields")
                 };
-                (
-                    self.builder.field_input(c, d.name, Value::Missing),
-                    Some(t.clone()),
-                )
+                let id = self.builder.field_input(c, d.name, default.clone());
+                (id, Some(t.clone()))
             }
             (DeclKind::Collection, _) => (self.builder.collection(d.name), None),
             (DeclKind::Def(_), _) => return,
         };
+        if let DeclKind::Input(_, default) = &self.decls[i].kind
+            && *default != Value::Missing
+        {
+            self.defaulted.push(id);
+        }
         if let Some(t) = &ty {
             self.types[i] = t.clone();
         }
@@ -1339,7 +1369,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// A literal value for a fixpoint option.
+    /// A literal value, for an input's default or a fixpoint option.
     fn literal(&mut self, e: &'a SExpr) -> Result<(Value, Type), Diagnostic> {
         let ok = matches!(
             &e.kind,

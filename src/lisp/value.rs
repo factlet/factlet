@@ -285,23 +285,90 @@ impl fmt::Display for Quantity {
     }
 }
 
+/// An enumeration such as filing status.
+#[derive(PartialEq, Eq, Debug)]
+pub struct EnumDef {
+    pub name: Box<str>,
+    pub variants: Box<[Box<str>]>,
+}
+
+/// One variant of an enumeration.
+#[derive(Clone)]
+pub struct Variant {
+    pub(crate) ty: Arc<EnumDef>,
+    pub(crate) index: usize,
+}
+
+impl Variant {
+    pub fn ty(&self) -> &Arc<EnumDef> {
+        &self.ty
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn name(&self) -> &str {
+        &self.ty.variants[self.index]
+    }
+}
+
+impl PartialEq for Variant {
+    fn eq(&self, o: &Variant) -> bool {
+        self.index == o.index && self.ty.name == o.ty.name
+    }
+}
+
+impl Eq for Variant {}
+
 /// A fact's value in a Lisp program. `Missing` is an unanswered input, or
-/// anything computed from one.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// anything computed from one; `Error` (division by zero, overflow)
+/// propagates the same way.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Value {
     Missing,
+    Error(Arc<str>),
     Bool(bool),
     Num(Quantity),
     Str(Arc<str>),
+    Enum(Variant),
+    List(Arc<[Value]>),
+}
+
+impl Value {
+    /// `Missing` or `Error`.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Value::Missing | Value::Error(_))
+    }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Missing => f.write_str("?"),
+            Value::Error(e) => write!(f, "<error: {e}>"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Num(q) => write!(f, "{q}"),
             Value::Str(s) => write!(f, "{s:?}"),
+            Value::Enum(v) => f.write_str(v.name()),
+            Value::List(items) => {
+                f.write_str("[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(" ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                f.write_str("]")
+            }
         }
+    }
+}
+
+/// The same as `Display`, so `explain` trees and test failures read like
+/// the source: `$58,000.00`, not `Num(Quantity { .. })`.
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }

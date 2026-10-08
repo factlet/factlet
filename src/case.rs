@@ -1,4 +1,5 @@
-use crate::graph::{Def, Graph};
+use crate::graph::{Def, Graph, Kind};
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ pub struct Stats {
     pub executed: u64,
     pub marked_green: u64,
     pub backdated: u64,
-    pub dirtied: u64,
+    pub changed: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,15 +22,17 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[derive(Clone)]
 struct Slot<V> {
     value: Option<V>,
     changed_at: u64,
     verified_at: u64,
     deps: Arc<[usize]>,
     dependents: Vec<usize>,
-    dirty: bool,
+    changed: bool,
 }
 
+#[derive(Clone)]
 struct State<V> {
     slots: Box<[Slot<V>]>,
     revision: u64,
@@ -43,6 +46,15 @@ pub struct Case<V> {
     state: State<V>,
 }
 
+impl<V: Clone> Clone for Case<V> {
+    fn clone(&self) -> Self {
+        Case {
+            graph: self.graph.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
 impl<V: Clone + PartialEq> Case<V> {
     pub fn new(graph: Arc<Graph<V>>) -> Self {
         let empty = || Slot {
@@ -51,7 +63,7 @@ impl<V: Clone + PartialEq> Case<V> {
             verified_at: 0,
             deps: Arc::new([]),
             dependents: Vec::new(),
-            dirty: false,
+            changed: false,
         };
         let slots = (0..graph.len()).map(|_| empty()).collect();
         let state = State {
@@ -93,6 +105,37 @@ impl<V: Clone + PartialEq> Case<V> {
     pub fn get(&mut self, id: usize) -> V {
         self.state.refresh(&self.graph, id);
         self.state.value(&self.graph, id).clone()
+    }
+
+    pub fn is_set(&self, id: usize) -> bool {
+        !matches!(self.graph.defs[id], Def::Input(_)) || self.state.slots[id].value.is_some()
+    }
+
+    pub fn deps(&mut self, id: usize) -> Arc<[usize]> {
+        self.state.refresh(&self.graph, id);
+        self.state.slots[id].deps.clone()
+    }
+
+    pub fn unanswered(&mut self, id: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![id];
+        while let Some(f) = stack.pop() {
+            if !seen.insert(f) {
+                continue;
+            }
+            match self.graph.kind(f) {
+                Kind::Derived => stack.extend(self.deps(f).iter().rev()),
+                _ if !self.is_set(f) => out.push(f),
+                _ => {}
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    pub fn fork(&self) -> Self {
+        self.clone()
     }
 
     pub fn revision(&self) -> u64 {
@@ -138,8 +181,8 @@ impl<V: Clone + PartialEq> Case<V> {
                     );
                 }
                 assert!(
-                    slot.dirty || !slots[d].dirty,
-                    "clean {} reads dirty {}",
+                    slot.changed || !slots[d].changed,
+                    "clean {} reads changed {}",
                     g.name(f),
                     g.name(d)
                 );
@@ -153,10 +196,10 @@ impl<V: Clone + PartialEq> State<V> {
         let mut stack = self.slots[id].dependents.clone();
         while let Some(d) = stack.pop() {
             let slot = &mut self.slots[d];
-            if !slot.dirty {
-                slot.dirty = true;
+            if !slot.changed {
+                slot.changed = true;
                 stack.extend_from_slice(&slot.dependents);
-                self.stats.dirtied += 1;
+                self.stats.changed += 1;
             }
         }
     }
@@ -197,7 +240,7 @@ impl<V: Clone + PartialEq> State<V> {
             Def::Constant(_) => 0,
             Def::Input(_) => slot.changed_at,
             Def::Derived(_) if slot.value.is_none() => self.execute(g, id),
-            Def::Derived(_) if !slot.dirty => slot.changed_at,
+            Def::Derived(_) if !slot.changed => slot.changed_at,
             Def::Derived(_) => self
                 .try_mark_green(g, id)
                 .unwrap_or_else(|| self.execute(g, id)),
@@ -213,7 +256,7 @@ impl<V: Clone + PartialEq> State<V> {
         }
         let slot = &mut self.slots[id];
         slot.verified_at = self.revision;
-        slot.dirty = false;
+        slot.changed = false;
         self.stats.marked_green += 1;
         Some(slot.changed_at)
     }
@@ -237,7 +280,7 @@ impl<V: Clone + PartialEq> State<V> {
             slot.changed_at = self.revision;
         }
         slot.verified_at = self.revision;
-        slot.dirty = false;
+        slot.changed = false;
         let changed_at = slot.changed_at;
         if *slot.deps != self.deps[start..] {
             let new: Arc<[usize]> = self.deps[start..].into();
@@ -257,13 +300,26 @@ pub struct Context<'a, V> {
 
 impl<V: Clone + PartialEq> Context<'_, V> {
     pub fn get(&mut self, id: usize) -> V {
+        self.with(id, V::clone)
+    }
+
+    pub fn with<R>(&mut self, id: usize, f: impl FnOnce(&V) -> R) -> R {
+        self.read(id);
+        f(self.state.value(self.graph, id))
+    }
+
+    pub fn is_set(&mut self, id: usize) -> bool {
+        self.read(id);
+        !matches!(self.graph.defs[id], Def::Input(_)) || self.state.slots[id].value.is_some()
+    }
+
+    fn read(&mut self, id: usize) {
         self.state.refresh(self.graph, id);
         if self.state.deps.last() != Some(&id)
             || self.state.deps.len() == *self.state.frames.last().unwrap()
         {
             self.state.deps.push(id);
         }
-        self.state.value(self.graph, id).clone()
     }
 
     pub fn name(&self, id: usize) -> &str {

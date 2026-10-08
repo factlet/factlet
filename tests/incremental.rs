@@ -26,7 +26,7 @@ fn only_affected_facts_rerun() {
         0,
         "fb isn't downstream of a, so it isn't checked"
     );
-    assert_eq!(c.stats().dirtied, 2);
+    assert_eq!(c.stats().changed, 2);
 
     c.reset_stats();
     c.set(a, 5).unwrap();
@@ -105,16 +105,16 @@ fn unrelated_reads_are_free() {
     assert_eq!(
         c.stats(),
         Stats {
-            dirtied: 1,
+            changed: 1,
             ..Default::default()
         },
         "the chain is never walked"
     );
 
-    // Marking stops at facts already dirty.
+    // Marking stops at facts already changed.
     c.set(a, 6).unwrap();
     c.set(a, 7).unwrap();
-    assert_eq!(c.stats().dirtied, 1);
+    assert_eq!(c.stats().changed, 1);
     assert_eq!(c.get(fa), 8);
     c.check_invariants();
 }
@@ -143,7 +143,60 @@ fn branches_not_taken_are_not_dependencies() {
     c.set(flag, 1).unwrap();
     assert_eq!(c.get(picked), 5);
     c.set(x, 6).unwrap();
-    assert_eq!(c.stats().dirtied, 2);
+    assert_eq!(c.stats().changed, 2);
     assert_eq!(c.get(picked), 6);
     c.check_invariants();
+}
+
+#[test]
+fn unanswered_follows_branches_taken() {
+    let mut b = Graph::<i64>::builder();
+    let flag = b.input("flag", 0);
+    let x = b.input("x", 1);
+    let y = b.input("y", 2);
+    let out = b.derived("out", move |cx| {
+        if cx.get(flag) != 0 {
+            cx.get(x)
+        } else {
+            cx.get(y)
+        }
+    });
+    let mut c = Case::new(b.build().unwrap());
+    assert_eq!(&*c.deps(out), &[flag, y]);
+    assert_eq!(c.unanswered(out), vec![flag, y]);
+
+    c.set(flag, 1).unwrap();
+    assert!(c.is_set(flag) && !c.is_set(x));
+    assert_eq!(c.unanswered(out), vec![x]);
+
+    c.set(x, 5).unwrap();
+    assert!(c.unanswered(out).is_empty());
+    c.check_invariants();
+}
+
+#[test]
+fn fork_keeps_memos() {
+    let mut b = Graph::<i64>::builder();
+    let a = b.input("a", 1);
+    let bb = b.input("b", 2);
+    let fa = b.derived("fa", move |cx| cx.get(a) * 10);
+    let fb = b.derived("fb", move |cx| cx.get(bb) * 10);
+    let total = b.derived("total", move |cx| cx.get(fa) + cx.get(fb));
+    let mut c = Case::new(b.build().unwrap());
+    assert_eq!(c.get(total), 30);
+
+    let mut what_if = c.fork();
+    what_if.reset_stats();
+    what_if.set(a, 5).unwrap();
+    assert_eq!(what_if.get(total), 70);
+    assert_eq!(
+        what_if.stats().executed,
+        2,
+        "fa and total rerun, fb is reused"
+    );
+    what_if.check_invariants();
+
+    c.reset_stats();
+    assert_eq!(c.get(total), 30);
+    assert_eq!(c.stats(), Stats::default(), "the original is untouched");
 }

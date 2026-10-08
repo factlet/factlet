@@ -1,4 +1,4 @@
-use crate::graph::{Def, Graph, Kind};
+use crate::graph::{Def, Fact, Graph, Kind, Member};
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
@@ -12,11 +12,34 @@ pub struct Stats {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(pub String);
+pub enum Error {
+    NotAnInput(String),
+    NotACollection(String),
+    NoSuchMember(String),
+    /// A collection field named without a member, or a global fact with one.
+    WrongScope(String),
+    DuplicateMember {
+        collection: String,
+        name: String,
+    },
+}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} is not an input and cannot be set", self.0)
+        match self {
+            Error::NotAnInput(n) => write!(f, "{n} is not an input and cannot be set"),
+            Error::NotACollection(n) => write!(f, "{n} is not a collection"),
+            Error::NoSuchMember(n) => write!(f, "{n}: no such member"),
+            Error::WrongScope(n) => {
+                write!(
+                    f,
+                    "{n}: name a member for collection fields, and only for them"
+                )
+            }
+            Error::DuplicateMember { collection, name } => {
+                write!(f, "{collection} already has #{name}")
+            }
+        }
     }
 }
 
@@ -27,17 +50,44 @@ struct Slot<V> {
     value: Option<V>,
     changed_at: u64,
     verified_at: u64,
-    deps: Arc<[usize]>,
-    dependents: Vec<usize>,
+    deps: Arc<[Fact]>,
+    dependents: Vec<Fact>,
     changed: bool,
+}
+
+impl<V> Slot<V> {
+    fn empty() -> Self {
+        Slot {
+            value: None,
+            changed_at: 0,
+            verified_at: 0,
+            deps: Arc::new([]),
+            dependents: Vec::new(),
+            changed: false,
+        }
+    }
+}
+
+/// A member's name and fields.
+type Row<V> = (Arc<str>, Box<[Slot<V>]>);
+
+#[derive(Clone)]
+struct Collection<V> {
+    /// `None` until answered.
+    members: Option<Arc<[Member]>>,
+    changed_at: u64,
+    dependents: Vec<Fact>,
+    /// Each member's name and fields, indexed by member.
+    rows: Vec<Row<V>>,
 }
 
 #[derive(Clone)]
 struct State<V> {
     slots: Box<[Slot<V>]>,
+    collections: Box<[Collection<V>]>,
     revision: u64,
     stats: Stats,
-    deps: Vec<usize>,
+    deps: Vec<Fact>,
     frames: Vec<usize>,
 }
 
@@ -57,17 +107,20 @@ impl<V: Clone> Clone for Case<V> {
 
 impl<V: Clone + PartialEq> Case<V> {
     pub fn new(graph: Arc<Graph<V>>) -> Self {
-        let empty = || Slot {
-            value: None,
-            changed_at: 0,
-            verified_at: 0,
-            deps: Arc::new([]),
-            dependents: Vec::new(),
-            changed: false,
-        };
-        let slots = (0..graph.len()).map(|_| empty()).collect();
+        let slots = (0..graph.len()).map(|_| Slot::empty()).collect();
+        let collections = graph
+            .collections
+            .iter()
+            .map(|_| Collection {
+                members: None,
+                changed_at: 0,
+                dependents: Vec::new(),
+                rows: Vec::new(),
+            })
+            .collect();
         let state = State {
             slots,
+            collections,
             revision: 0,
             stats: Stats::default(),
             deps: Vec::new(),
@@ -80,54 +133,134 @@ impl<V: Clone + PartialEq> Case<V> {
         &self.graph
     }
 
-    pub fn set(&mut self, id: usize, value: V) -> Result<(), Error> {
-        self.write(id, Some(value))
+    pub fn set(&mut self, fact: impl Into<Fact>, value: V) -> Result<(), Error> {
+        self.write(fact.into(), Some(value))
     }
 
-    pub fn unset(&mut self, id: usize) -> Result<(), Error> {
-        self.write(id, None)
+    pub fn unset(&mut self, fact: impl Into<Fact>) -> Result<(), Error> {
+        self.write(fact.into(), None)
     }
 
-    fn write(&mut self, id: usize, new: Option<V>) -> Result<(), Error> {
-        if !matches!(self.graph.defs[id], Def::Input(_)) {
-            return Err(Error(self.graph.name(id).to_string()));
+    fn write(&mut self, fact: Fact, new: Option<V>) -> Result<(), Error> {
+        let g = &*self.graph;
+        if !matches!(g.defs[fact.id], Def::Input(_)) {
+            return Err(Error::NotAnInput(self.name(fact)));
         }
-        let slot = &mut self.state.slots[id];
+        self.check_scope(fact)?;
+        if self.state.slot(g, fact).is_none() {
+            return Err(Error::NoSuchMember(self.name(fact)));
+        }
+        let revision = self.state.revision + 1;
+        let slot = self.state.slot_mut(g, fact).expect("checked above");
         if slot.value != new {
-            self.state.revision += 1;
             slot.value = new;
-            slot.changed_at = self.state.revision;
-            self.state.mark_dependents(id);
+            slot.changed_at = revision;
+            self.state.revision = revision;
+            self.state.mark_dependents(g, fact);
         }
         Ok(())
     }
 
-    pub fn get(&mut self, id: usize) -> V {
-        self.state.refresh(&self.graph, id);
-        self.state.value(&self.graph, id).clone()
-    }
-
-    pub fn is_set(&self, id: usize) -> bool {
-        !matches!(self.graph.defs[id], Def::Input(_)) || self.state.slots[id].value.is_some()
-    }
-
-    pub fn deps(&mut self, id: usize) -> Arc<[usize]> {
-        if let Def::Folded { deps, .. } = &self.graph.defs[id] {
-            return deps.clone();
+    pub fn add_member(&mut self, collection: usize, name: &str) -> Result<Member, Error> {
+        let c = self.collection_index(collection)?;
+        let g = &*self.graph;
+        let coll = &mut self.state.collections[c];
+        if coll.rows.iter().any(|(n, _)| &**n == name) {
+            return Err(Error::DuplicateMember {
+                collection: g.name(collection).to_string(),
+                name: name.to_string(),
+            });
         }
-        self.state.refresh(&self.graph, id);
-        self.state.slots[id].deps.clone()
+        let member = Member(u32::try_from(coll.rows.len()).expect("too many members"));
+        let slots = g.collections[c].iter().map(|_| Slot::empty()).collect();
+        coll.rows.push((name.into(), slots));
+        let mut members = coll.members.as_deref().unwrap_or_default().to_vec();
+        members.push(member);
+        coll.members = Some(members.into());
+        self.state.revision += 1;
+        coll.changed_at = self.state.revision;
+        self.state.mark_dependents(g, collection.into());
+        Ok(member)
     }
 
-    pub fn unanswered(&mut self, id: usize) -> Vec<usize> {
+    /// A collection's members, or `None` if unanswered.
+    pub fn members(&self, collection: usize) -> Result<Option<Arc<[Member]>>, Error> {
+        let c = self.collection_index(collection)?;
+        Ok(self.state.collections[c].members.clone())
+    }
+
+    pub fn member_name(&self, collection: usize, member: Member) -> Option<&str> {
+        let c = self.collection_index(collection).ok()?;
+        let (name, _) = self.state.collections[c].rows.get(member.0 as usize)?;
+        Some(name)
+    }
+
+    /// `line11/agi`, or `w2s/#acme/box1Wages` for a member's field.
+    pub fn name(&self, fact: impl Into<Fact>) -> String {
+        let fact = fact.into();
+        let g = &self.graph;
+        match (g.scopes[fact.id], fact.member) {
+            (Some(c), Some(m)) => {
+                let member = self.member_name(c, m).unwrap_or("?");
+                let field = &g.name(fact.id)[g.name(c).len() + 3..];
+                format!("{}/#{member}/{field}", g.name(c))
+            }
+            _ => g.name(fact.id).to_string(),
+        }
+    }
+
+    fn collection_index(&self, id: usize) -> Result<usize, Error> {
+        match self.graph.defs[id] {
+            Def::Collection => Ok(self.graph.pos[id]),
+            _ => Err(Error::NotACollection(self.graph.name(id).to_string())),
+        }
+    }
+
+    fn check_scope(&self, fact: Fact) -> Result<(), Error> {
+        if self.graph.scopes[fact.id].is_some() != fact.member.is_some() {
+            return Err(Error::WrongScope(self.graph.name(fact.id).to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn get(&mut self, fact: impl Into<Fact>) -> V {
+        let fact = fact.into();
+        if let Err(e) = self.check_scope(fact) {
+            panic!("{e}");
+        }
+        self.state.refresh(&self.graph, fact);
+        self.state.value(&self.graph, fact).clone()
+    }
+
+    pub fn is_set(&self, fact: impl Into<Fact>) -> bool {
+        self.state.is_set(&self.graph, fact.into())
+    }
+
+    pub fn deps(&mut self, fact: impl Into<Fact>) -> Arc<[Fact]> {
+        let fact = fact.into();
+        match &self.graph.defs[fact.id] {
+            Def::Folded { deps, .. } => deps.clone(),
+            Def::Derived(_) => {
+                self.get(fact);
+                self.state
+                    .slot(&self.graph, fact)
+                    .expect("live")
+                    .deps
+                    .clone()
+            }
+            _ => Arc::new([]),
+        }
+    }
+
+    pub fn unanswered(&mut self, fact: impl Into<Fact>) -> Vec<Fact> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        let mut stack = vec![id];
+        let mut stack = vec![fact.into()];
         while let Some(f) = stack.pop() {
             if !seen.insert(f) {
                 continue;
             }
-            match self.graph.kind(f) {
+            match self.graph.kind(f.id) {
                 Kind::Derived => stack.extend(self.deps(f).iter().rev()),
                 _ if !self.is_set(f) => out.push(f),
                 _ => {}
@@ -155,50 +288,118 @@ impl<V: Clone + PartialEq> Case<V> {
 
     #[doc(hidden)]
     pub fn check_invariants(&self) {
-        let (g, slots) = (&*self.graph, &self.state.slots);
-        for (f, slot) in slots.iter().enumerate() {
-            let mut unique = slot.dependents.clone();
+        let (g, s) = (&*self.graph, &self.state);
+        let mut facts: Vec<Fact> = (0..g.len())
+            .filter(|&id| g.scopes[id].is_none())
+            .map(Fact::from)
+            .collect();
+        for (c, fields) in g.collections.iter().enumerate() {
+            for m in s.collections[c].members.iter().flat_map(|m| m.iter()) {
+                facts.extend(fields.iter().map(|&f| Fact::from((f, *m))));
+            }
+        }
+
+        for &f in &facts {
+            let dependents = s.dependents(g, f);
+            let mut unique = dependents.to_vec();
             unique.sort_unstable();
             unique.dedup();
             assert_eq!(
                 unique.len(),
-                slot.dependents.len(),
+                dependents.len(),
                 "{} lists a dependent twice",
-                g.name(f)
+                self.name(f)
             );
-            for &d in &slot.dependents {
+            for &d in dependents {
                 assert!(
-                    slots[d].deps.contains(&f),
+                    s.slot(g, d).expect("live").deps.contains(&f),
                     "{} lists {}, which doesn't read it",
-                    g.name(f),
-                    g.name(d)
+                    self.name(f),
+                    self.name(d)
                 );
             }
+            if !matches!(g.defs[f.id], Def::Derived(_)) {
+                continue;
+            }
+            let slot = s.slot(g, f).expect("live");
             for &d in slot.deps.iter() {
-                if !g.is_fixed(d) {
-                    assert!(
-                        slots[d].dependents.contains(&f),
-                        "{} reads {}, which doesn't list it",
-                        g.name(f),
-                        g.name(d)
-                    );
+                if g.is_fixed(d.id) {
+                    continue;
                 }
                 assert!(
-                    slot.changed || !slots[d].changed,
-                    "clean {} reads changed {}",
-                    g.name(f),
-                    g.name(d)
+                    s.dependents(g, d).contains(&f),
+                    "{} reads {}, which doesn't list it",
+                    self.name(f),
+                    self.name(d)
                 );
+                if let Some(dep) = s.slot(g, d) {
+                    assert!(
+                        slot.changed || !dep.changed,
+                        "clean {} reads changed {}",
+                        self.name(f),
+                        self.name(d)
+                    );
+                }
             }
         }
     }
 }
 
 impl<V: Clone + PartialEq> State<V> {
-    fn mark_dependents(&mut self, id: usize) {
-        let mut stack = self.slots[id].dependents.clone();
+    /// An input's or rule's storage; `None` for anything else, or a member
+    /// that doesn't exist.
+    fn slot(&self, g: &Graph<V>, f: Fact) -> Option<&Slot<V>> {
+        if !matches!(g.defs[f.id], Def::Input(_) | Def::Derived(_)) {
+            return None;
+        }
+        match (g.scopes[f.id], f.member) {
+            (Some(c), Some(m)) => {
+                let (_, row) = self.collections[g.pos[c]].rows.get(m.0 as usize)?;
+                Some(&row[g.pos[f.id]])
+            }
+            _ => Some(&self.slots[f.id]),
+        }
+    }
+
+    fn slot_mut(&mut self, g: &Graph<V>, f: Fact) -> Option<&mut Slot<V>> {
+        if !matches!(g.defs[f.id], Def::Input(_) | Def::Derived(_)) {
+            return None;
+        }
+        match (g.scopes[f.id], f.member) {
+            (Some(c), Some(m)) => {
+                let (_, row) = self.collections[g.pos[c]].rows.get_mut(m.0 as usize)?;
+                Some(&mut row[g.pos[f.id]])
+            }
+            _ => Some(&mut self.slots[f.id]),
+        }
+    }
+
+    fn dependents(&self, g: &Graph<V>, f: Fact) -> &[Fact] {
+        match g.defs[f.id] {
+            Def::Collection => &self.collections[g.pos[f.id]].dependents,
+            _ => self.slot(g, f).map_or(&[], |s| &s.dependents),
+        }
+    }
+
+    fn dependents_mut(&mut self, g: &Graph<V>, f: Fact) -> Option<&mut Vec<Fact>> {
+        match g.defs[f.id] {
+            Def::Collection => Some(&mut self.collections[g.pos[f.id]].dependents),
+            _ => self.slot_mut(g, f).map(|s| &mut s.dependents),
+        }
+    }
+
+    fn is_set(&self, g: &Graph<V>, f: Fact) -> bool {
+        match g.defs[f.id] {
+            Def::Collection => self.collections[g.pos[f.id]].members.is_some(),
+            Def::Input(_) => self.slot(g, f).is_some_and(|s| s.value.is_some()),
+            _ => true,
+        }
+    }
+
+    fn mark_dependents(&mut self, g: &Graph<V>, f: Fact) {
+        let mut stack = self.dependents(g, f).to_vec();
         while let Some(d) = stack.pop() {
-            let slot = &mut self.slots[d];
+            let slot = self.slot_mut(g, d).expect("dependents are live rules");
             if !slot.changed {
                 slot.changed = true;
                 stack.extend_from_slice(&slot.dependents);
@@ -207,9 +408,9 @@ impl<V: Clone + PartialEq> State<V> {
         }
     }
 
-    /// Update reverse edges after `id`'s reads changed from `old` to `new`.
-    fn relink(&mut self, g: &Graph<V>, id: usize, old: &[usize], new: &[usize]) {
-        let sorted = |s: &[usize]| {
+    /// Update reverse edges after `f`'s reads changed from `old` to `new`.
+    fn relink(&mut self, g: &Graph<V>, f: Fact, old: &[Fact], new: &[Fact]) {
+        let sorted = |s: &[Fact]| {
             let mut v = s.to_vec();
             v.sort_unstable();
             v.dedup();
@@ -217,79 +418,107 @@ impl<V: Clone + PartialEq> State<V> {
         };
         let (old, new) = (sorted(old), sorted(new));
         for &d in old.iter().filter(|d| new.binary_search(d).is_err()) {
-            let list = &mut self.slots[d].dependents;
-            if let Some(p) = list.iter().position(|&x| x == id) {
+            if let Some(list) = self.dependents_mut(g, d)
+                && let Some(p) = list.iter().position(|&x| x == f)
+            {
                 list.swap_remove(p);
             }
         }
         for &d in new.iter().filter(|d| old.binary_search(d).is_err()) {
-            if !g.is_fixed(d) {
-                self.slots[d].dependents.push(id);
+            if !g.is_fixed(d.id)
+                && let Some(list) = self.dependents_mut(g, d)
+            {
+                list.push(f);
             }
         }
     }
 
-    fn value<'a>(&'a self, g: &'a Graph<V>, id: usize) -> &'a V {
-        match (&g.defs[id], &self.slots[id].value) {
-            (Def::Constant(v) | Def::Folded { value: v, .. }, _) | (_, Some(v)) => v,
+    fn value<'a>(&'a self, g: &'a Graph<V>, f: Fact) -> &'a V {
+        let def = &g.defs[f.id];
+        match def {
+            Def::Constant(v) | Def::Folded { value: v, .. } => return v,
+            Def::Collection => panic!("{} is a collection; read it with `members`", g.name(f.id)),
+            Def::Input(_) | Def::Derived(_) => {}
+        }
+        let Some(slot) = self.slot(g, f) else {
+            panic!("{}: no such member", g.name(f.id));
+        };
+        match (def, &slot.value) {
+            (_, Some(v)) => v,
             (Def::Input(default), None) => default,
-            (Def::Derived(_), None) => unreachable!("read a rule before refreshing it"),
+            _ => unreachable!("read a rule before refreshing it"),
         }
     }
 
-    fn refresh(&mut self, g: &Graph<V>, id: usize) -> u64 {
-        let slot = &self.slots[id];
-        match &g.defs[id] {
-            Def::Constant(_) | Def::Folded { .. } => 0,
-            Def::Input(_) => slot.changed_at,
-            Def::Derived(_) if slot.value.is_none() => self.execute(g, id),
-            Def::Derived(_) if !slot.changed => slot.changed_at,
-            Def::Derived(_) => self
-                .try_mark_green(g, id)
-                .unwrap_or_else(|| self.execute(g, id)),
+    fn refresh(&mut self, g: &Graph<V>, f: Fact) -> u64 {
+        let rule = match &g.defs[f.id] {
+            Def::Constant(_) | Def::Folded { .. } => return 0,
+            Def::Collection => return self.collections[g.pos[f.id]].changed_at,
+            Def::Input(_) => false,
+            Def::Derived(_) => true,
+        };
+        let Some(slot) = self.slot(g, f) else {
+            panic!("{}: no such member", g.name(f.id));
+        };
+        if !rule || (slot.value.is_some() && !slot.changed) {
+            return slot.changed_at;
         }
+        if slot.value.is_some()
+            && let Some(changed_at) = self.try_mark_green(g, f)
+        {
+            return changed_at;
+        }
+        self.execute(g, f)
     }
 
-    fn try_mark_green(&mut self, g: &Graph<V>, id: usize) -> Option<u64> {
-        let (since, deps) = (self.slots[id].verified_at, self.slots[id].deps.clone());
+    fn try_mark_green(&mut self, g: &Graph<V>, f: Fact) -> Option<u64> {
+        let slot = self.slot(g, f).expect("live");
+        let (since, deps) = (slot.verified_at, slot.deps.clone());
         for &d in deps.iter() {
             if self.refresh(g, d) > since {
                 return None;
             }
         }
-        let slot = &mut self.slots[id];
-        slot.verified_at = self.revision;
+        let revision = self.revision;
+        let slot = self.slot_mut(g, f).expect("live");
+        slot.verified_at = revision;
         slot.changed = false;
+        let changed_at = slot.changed_at;
         self.stats.marked_green += 1;
-        Some(slot.changed_at)
+        Some(changed_at)
     }
 
-    fn execute(&mut self, g: &Graph<V>, id: usize) -> u64 {
-        let Def::Derived(rule) = &g.defs[id] else {
+    fn execute(&mut self, g: &Graph<V>, f: Fact) -> u64 {
+        let Def::Derived(rule) = &g.defs[f.id] else {
             unreachable!()
         };
         self.frames.push(self.deps.len());
         let value = rule(&mut Context {
             graph: g,
             state: self,
+            member: f.member,
+            scope: g.scopes[f.id],
         });
         let start = self.frames.pop().expect("frame pushed above");
         self.stats.executed += 1;
 
-        let slot = &mut self.slots[id];
+        let revision = self.revision;
+        let deps = std::mem::take(&mut self.deps);
+        let read = &deps[start..];
+        let slot = self.slot_mut(g, f).expect("live");
         let backdated = slot.value.as_ref() == Some(&value);
         slot.value = Some(value);
         if !backdated {
-            slot.changed_at = self.revision;
+            slot.changed_at = revision;
         }
-        slot.verified_at = self.revision;
+        slot.verified_at = revision;
         slot.changed = false;
         let changed_at = slot.changed_at;
-        if *slot.deps != self.deps[start..] {
-            let new: Arc<[usize]> = self.deps[start..].into();
-            let old = std::mem::replace(&mut slot.deps, new.clone());
-            self.relink(g, id, &old, &new);
+        if *slot.deps != *read {
+            let old = std::mem::replace(&mut slot.deps, read.into());
+            self.relink(g, f, &old, read);
         }
+        self.deps = deps;
         self.deps.truncate(start);
         self.stats.backdated += backdated as u64;
         changed_at
@@ -299,33 +528,76 @@ impl<V: Clone + PartialEq> State<V> {
 pub struct Context<'a, V> {
     graph: &'a Graph<V>,
     state: &'a mut State<V>,
+    /// The member being computed, for field rules.
+    member: Option<Member>,
+    scope: Option<usize>,
 }
 
 impl<V: Clone + PartialEq> Context<'_, V> {
-    pub fn get(&mut self, id: usize) -> V {
-        self.with(id, V::clone)
+    /// A field of this rule's own collection, named without a member, reads
+    /// the member being computed.
+    pub fn get(&mut self, fact: impl Into<Fact>) -> V {
+        self.with(fact, V::clone)
     }
 
-    pub fn with<R>(&mut self, id: usize, f: impl FnOnce(&V) -> R) -> R {
-        self.read(id);
-        f(self.state.value(self.graph, id))
+    pub fn with<R>(&mut self, fact: impl Into<Fact>, f: impl FnOnce(&V) -> R) -> R {
+        let fact = self.read(fact.into());
+        f(self.state.value(self.graph, fact))
     }
 
-    pub fn is_set(&mut self, id: usize) -> bool {
-        self.read(id);
-        !matches!(self.graph.defs[id], Def::Input(_)) || self.state.slots[id].value.is_some()
+    pub fn is_set(&mut self, fact: impl Into<Fact>) -> bool {
+        let fact = self.read(fact.into());
+        self.state.is_set(self.graph, fact)
     }
 
-    fn read(&mut self, id: usize) {
-        self.state.refresh(self.graph, id);
-        if self.state.deps.last() != Some(&id)
-            || self.state.deps.len() == *self.state.frames.last().unwrap()
-        {
-            self.state.deps.push(id);
-        }
+    /// A collection's members; empty if unanswered.
+    pub fn members(&mut self, collection: usize) -> Arc<[Member]> {
+        assert!(
+            matches!(self.graph.defs[collection], Def::Collection),
+            "{} is not a collection",
+            self.graph.name(collection)
+        );
+        self.record(collection.into());
+        let c = self.graph.pos[collection];
+        self.state.collections[c]
+            .members
+            .clone()
+            .unwrap_or_else(|| Arc::new([]))
+    }
+
+    /// The member this rule is computing. Panics outside a field rule.
+    pub fn member(&self) -> Member {
+        self.member.expect("not computing a collection field")
     }
 
     pub fn name(&self, id: usize) -> &str {
         self.graph.name(id)
+    }
+
+    fn read(&mut self, fact: Fact) -> Fact {
+        let fact = self.resolve(fact);
+        self.state.refresh(self.graph, fact);
+        self.record(fact);
+        fact
+    }
+
+    fn record(&mut self, fact: Fact) {
+        let start = *self.state.frames.last().expect("a rule is running");
+        if self.state.deps.len() == start || self.state.deps.last() != Some(&fact) {
+            self.state.deps.push(fact);
+        }
+    }
+
+    fn resolve(&self, fact: Fact) -> Fact {
+        let name = || self.graph.name(fact.id);
+        match (self.graph.scopes[fact.id], fact.member) {
+            (Some(c), None) if Some(c) == self.scope => Fact {
+                id: fact.id,
+                member: self.member,
+            },
+            (Some(_), None) => panic!("{}: name a member", name()),
+            (None, Some(_)) => panic!("{} is not a collection field", name()),
+            _ => fact,
+        }
     }
 }

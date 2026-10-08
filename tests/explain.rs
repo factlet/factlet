@@ -23,7 +23,7 @@ taxable = 0
 
     c.set(wages, 20_000).unwrap();
     let e = c.explain(taxable);
-    assert_eq!(e.root.value, 4_250);
+    assert_eq!(e.root.value, Some(4_250));
     assert!(e.root.children[0].set);
 }
 

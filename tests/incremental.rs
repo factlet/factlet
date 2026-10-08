@@ -72,8 +72,8 @@ fn only_inputs_are_written() {
     let k = b.constant("k", 1);
     let d = b.derived("d", move |cx| cx.get(k));
     let mut c = Case::new(b.build().unwrap());
-    assert_eq!(c.set(k, 2), Err(Error("k".into())));
-    assert_eq!(c.set(d, 2), Err(Error("d".into())));
+    assert_eq!(c.set(k, 2), Err(Error::NotAnInput("k".into())));
+    assert_eq!(c.set(d, 2), Err(Error::NotAnInput("d".into())));
 
     let mut b = Graph::<i64>::builder();
     b.input("a", 0);
@@ -223,6 +223,6 @@ fn law_only_rules_fold() {
     c.set(wages, 20_000).unwrap();
     assert_eq!(c.get(taxable), 4_250);
     assert_eq!(c.stats().executed, 1);
-    assert_eq!(c.set(std, 0), Err(Error("std".into())));
+    assert_eq!(c.set(std, 0), Err(Error::NotAnInput("std".into())));
     c.check_invariants();
 }

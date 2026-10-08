@@ -3,4 +3,4 @@ pub mod explain;
 pub mod graph;
 
 pub use case::Case;
-pub use graph::Graph;
+pub use graph::{Fact, Graph, Member};

@@ -4,22 +4,36 @@ use crate::lisp::cycles;
 use crate::lisp::domain::{Domain, Type};
 use crate::lisp::eval::{Agg, Env, Expr, Fixpoint, Op, eval};
 use crate::lisp::num::Num;
-use crate::lisp::parser::{SExpr, SExprKind, Span, read};
+use crate::lisp::parser::{SExpr, SExprKind, Span, read_file};
 use crate::lisp::value::{Quantity, UnitDef, Value, ValueError};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
 /// An error in a program, at the form that caused it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Diagnostic {
+    /// The file's name, or empty for a program loaded from one string.
+    pub file: String,
     pub span: Span,
     pub message: String,
 }
 
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {}", self.span.line, self.span.col, self.message)
+        let mut at = self.file.clone();
+        // Line 0 is the file as a whole, such as one that couldn't be found.
+        if self.span.line > 0 {
+            if !at.is_empty() {
+                at.push(':');
+            }
+            at += &format!("{}:{}", self.span.line, self.span.col);
+        }
+        if at.is_empty() {
+            f.write_str(&self.message)
+        } else {
+            write!(f, "{at}: {}", self.message)
+        }
     }
 }
 
@@ -46,10 +60,13 @@ struct Decl<'a> {
     kind: DeclKind<'a>,
     /// The collection declaration this is a field of.
     scope: Option<usize>,
+    /// The module it was declared in, which its rule's names resolve in.
+    module: usize,
 }
 
 /// A `defn`: typed parameters and a body, checked once.
 struct Func<'a> {
+    module: usize,
     params: Vec<(&'a str, Type)>,
     body: &'a SExpr,
     state: FuncState,
@@ -64,6 +81,9 @@ enum FuncState {
 /// `(fixpoint name :start value :within tolerance :max n)`.
 struct FixDecl<'a> {
     name: &'a str,
+    module: usize,
+    /// The definition it names, once resolved.
+    decl: Option<usize>,
     span: Span,
     start: &'a SExpr,
     within: Option<&'a SExpr>,
@@ -100,6 +120,8 @@ enum State {
 
 struct Compiler<'a> {
     domain: Domain,
+    /// Each module's name prefixes to try, innermost first: `a/b/`, `a/`, ``.
+    modules: Vec<Vec<String>>,
     decls: Vec<Decl<'a>>,
     globals: HashMap<&'a str, usize>,
     fields: HashMap<(usize, &'a str), usize>,
@@ -132,6 +154,7 @@ struct Scope<'a> {
     /// Compiling a member of the active cycle, whose references to other
     /// members read their current guesses.
     in_group: bool,
+    module: usize,
 }
 
 fn sym(e: &SExpr) -> Option<&str> {
@@ -143,20 +166,236 @@ fn sym(e: &SExpr) -> Option<&str> {
 
 fn err<T>(span: Span, message: impl Into<String>) -> Result<T, Diagnostic> {
     Err(Diagnostic {
+        file: String::new(),
         span,
         message: message.into(),
     })
 }
 
 pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagnostic>> {
-    let forms = read(src).map_err(|e| {
-        vec![Diagnostic {
-            span: e.span,
-            message: e.message,
-        }]
-    })?;
+    compile_files(
+        "",
+        &mut |name| name.is_empty().then(|| src.to_string()),
+        domain,
+    )
+}
+
+/// A form to declare, and the module it's in.
+struct Item<'a> {
+    form: &'a SExpr,
+    module: usize,
+}
+
+/// Load `main` and every file it includes, then compile them as one
+/// program.
+pub(crate) fn compile_files(
+    main: &str,
+    load: &mut dyn FnMut(&str) -> Option<String>,
+    domain: &Domain,
+) -> Result<Compiled, Vec<Diagnostic>> {
+    let mut errors = Vec::new();
+    let files = load_all(main, load, &mut errors);
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    let mut result = compile_loaded(&files, domain, errors);
+    if let Err(errors) = &mut result {
+        for e in errors {
+            e.file = names.get(e.span.file as usize).unwrap_or(&main).to_string();
+        }
+    }
+    result
+}
+
+/// Every file reachable through `(include "…")`, parsed, in load order.
+fn load_all(
+    main: &str,
+    load: &mut dyn FnMut(&str) -> Option<String>,
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<(String, Vec<SExpr>)> {
+    let mut files: Vec<(String, Vec<SExpr>)> = Vec::new();
+    let mut queue = vec![(main.to_string(), Span::default())];
+    let mut seen = HashSet::new();
+    while let Some((name, from)) = queue.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(src) = load(&name) else {
+            errors.push(Diagnostic {
+                file: String::new(),
+                span: from,
+                message: format!("can't find `{name}`"),
+            });
+            continue;
+        };
+        let id = files.len() as u32;
+        let forms = read_file(&src, id).unwrap_or_else(|e| {
+            errors.push(Diagnostic {
+                file: String::new(),
+                span: e.span,
+                message: e.message,
+            });
+            Vec::new()
+        });
+        let mut includes = Vec::new();
+        find_includes(&forms, &mut includes);
+        queue.extend(includes.into_iter().rev());
+        files.push((name, forms));
+    }
+    files
+}
+
+fn find_includes(forms: &[SExpr], out: &mut Vec<(String, Span)>) {
+    for form in forms {
+        let SExprKind::List(items) = &form.kind else {
+            continue;
+        };
+        match (items.first().and_then(sym), items.get(1).map(|e| &e.kind)) {
+            (Some("include"), Some(SExprKind::Str(name))) => {
+                out.push((name.to_string(), form.span))
+            }
+            (Some("module"), _) => find_includes(items.get(2..).unwrap_or_default(), out),
+            _ => {}
+        }
+    }
+}
+
+/// Splice includes and modules into one list of declarations.
+struct Flatten<'a> {
+    files: &'a [(String, Vec<SExpr>)],
+    index: HashMap<&'a str, usize>,
+    /// Each module's prefix and parent.
+    modules: Vec<(String, usize)>,
+    items: Vec<Item<'a>>,
+    /// Files being included, for cycle reports.
+    stack: Vec<usize>,
+    /// (file, module) pairs already spliced in.
+    done: HashSet<(usize, usize)>,
+    errors: Vec<Diagnostic>,
+}
+
+impl<'a> Flatten<'a> {
+    fn forms(&mut self, forms: &'a [SExpr], module: usize) {
+        for form in forms {
+            let items = match &form.kind {
+                SExprKind::List(items) => &items[..],
+                _ => &[],
+            };
+            match items.first().and_then(sym) {
+                Some("module") => {
+                    let Some(name) = items.get(1).and_then(sym) else {
+                        self.error(form.span, "expected (module name forms…)");
+                        continue;
+                    };
+                    let prefix = format!("{}{name}/", self.modules[module].0);
+                    self.modules.push((prefix, module));
+                    let inner = self.modules.len() - 1;
+                    self.forms(&items[2..], inner);
+                }
+                Some("include") => {
+                    let name = match items {
+                        [_, e] => match &e.kind {
+                            SExprKind::Str(name) => name,
+                            _ => {
+                                self.error(form.span, "expected (include \"file\")");
+                                continue;
+                            }
+                        },
+                        _ => {
+                            self.error(form.span, "expected (include \"file\")");
+                            continue;
+                        }
+                    };
+                    // A file that couldn't be loaded is already reported.
+                    let Some(&file) = self.index.get(&**name) else {
+                        continue;
+                    };
+                    if let Some(at) = self.stack.iter().position(|&f| f == file) {
+                        let mut path: Vec<&str> = self.stack[at..]
+                            .iter()
+                            .map(|&f| self.files[f].0.as_str())
+                            .collect();
+                        path.push(&self.files[file].0);
+                        let message = format!("include cycle: {}", path.join(" -> "));
+                        self.error(form.span, message);
+                        continue;
+                    }
+                    if !self.done.insert((file, module)) {
+                        continue;
+                    }
+                    self.stack.push(file);
+                    self.forms(&self.files[file].1, module);
+                    self.stack.pop();
+                }
+                _ => self.items.push(Item { form, module }),
+            }
+        }
+    }
+
+    fn error(&mut self, span: Span, message: impl Into<String>) {
+        self.errors.push(Diagnostic {
+            file: String::new(),
+            span,
+            message: message.into(),
+        });
+    }
+}
+
+fn compile_loaded(
+    files: &[(String, Vec<SExpr>)],
+    domain: &Domain,
+    errors: Vec<Diagnostic>,
+) -> Result<Compiled, Vec<Diagnostic>> {
+    let mut flat = Flatten {
+        files,
+        index: files
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.as_str(), i))
+            .collect(),
+        modules: vec![(String::new(), 0)],
+        items: Vec::new(),
+        stack: vec![0],
+        done: HashSet::from([(0, 0)]),
+        errors,
+    };
+    if let Some((_, forms)) = files.first() {
+        flat.forms(forms, 0);
+    }
+    let Flatten {
+        modules,
+        items,
+        errors,
+        ..
+    } = flat;
+    // Declared names with their module's prefix: `sch-a/line17`.
+    let full: Vec<Option<String>> = items
+        .iter()
+        .map(|item| {
+            let SExprKind::List(parts) = &item.form.kind else {
+                return None;
+            };
+            match parts.first().and_then(sym) {
+                Some("input" | "def" | "collection" | "defn") => {
+                    let name = parts.get(1).and_then(sym)?;
+                    Some(format!("{}{name}", modules[item.module].0))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    let prefixes = (0..modules.len())
+        .map(|mut m| {
+            let mut chain = vec![modules[m].0.clone()];
+            while m != 0 {
+                m = modules[m].1;
+                chain.push(modules[m].0.clone());
+            }
+            chain
+        })
+        .collect();
+
     let mut c = Compiler {
         domain: domain.clone(),
+        modules: prefixes,
         decls: Vec::new(),
         globals: HashMap::new(),
         fields: HashMap::new(),
@@ -172,16 +411,16 @@ pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagno
         fact_types: Vec::new(),
         defaulted: Vec::new(),
         stack: Vec::new(),
-        errors: Vec::new(),
+        errors,
     };
     // Types first, so declarations can use them in any order.
-    for form in &forms {
-        if let Err(e) = c.declare_type(form) {
+    for item in &items {
+        if let Err(e) = c.declare_type(item.form) {
             c.errors.push(e);
         }
     }
-    for form in &forms {
-        if let Err(e) = c.declare(form, None) {
+    for (item, full) in items.iter().zip(&full) {
+        if let Err(e) = c.declare(item.form, None, item.module, full.as_deref()) {
             c.errors.push(e);
         }
     }
@@ -197,26 +436,20 @@ pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagno
     let mut names: Vec<&str> = c.funcs.keys().copied().collect();
     names.sort_unstable();
     for name in names {
-        let _ = c.func_body(
-            name,
-            Span {
-                start: 0,
-                end: 0,
-                line: 1,
-                col: 1,
-            },
-        );
+        let _ = c.func_body(name, Span::default());
     }
     // Drop the placeholder errors of cycles already reported.
     c.errors.retain(|d| !d.message.is_empty());
     if !c.errors.is_empty() {
-        c.errors.sort_by_key(|d| d.span.start);
+        c.errors.sort_by_key(|d| (d.span.file, d.span.start));
         return Err(c.errors);
     }
+    let first = items.first().map_or(Span::default(), |i| i.form.span);
     let graph = c.builder.build().map_err(|errs| {
         errs.into_iter()
             .map(|e| Diagnostic {
-                span: forms[0].span,
+                file: String::new(),
+                span: first,
                 message: e.to_string(),
             })
             .collect::<Vec<_>>()
@@ -230,6 +463,23 @@ pub(crate) fn compile(src: &str, domain: &Domain) -> Result<Compiled, Vec<Diagno
 }
 
 impl<'a> Compiler<'a> {
+    /// A global declaration by name, as seen from `module`: its own names
+    /// first, then each enclosing module's, then the top level's.
+    fn global(&self, module: usize, s: &str) -> Option<usize> {
+        self.modules[module]
+            .iter()
+            .find_map(|prefix| self.globals.get(format!("{prefix}{s}").as_str()).copied())
+    }
+
+    /// A function's full name, as seen from `module`.
+    fn func(&self, module: usize, s: &str) -> Option<&'a str> {
+        self.modules[module].iter().find_map(|prefix| {
+            self.funcs
+                .get_key_value(format!("{prefix}{s}").as_str())
+                .map(|(k, _)| *k)
+        })
+    }
+
     fn declare_type(&mut self, form: &SExpr) -> Result<(), Diagnostic> {
         let SExprKind::List(items) = &form.kind else {
             return Ok(());
@@ -293,7 +543,15 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn declare(&mut self, form: &'a SExpr, scope: Option<usize>) -> Result<(), Diagnostic> {
+    /// Declare `form`, a top-level declaration named `full` (with its
+    /// module's prefix), or a field of collection `scope`.
+    fn declare(
+        &mut self,
+        form: &'a SExpr,
+        scope: Option<usize>,
+        module: usize,
+        full: Option<&'a str>,
+    ) -> Result<(), Diagnostic> {
         let span = form.span;
         let SExprKind::List(items) = &form.kind else {
             return err(span, format!("expected a declaration, found `{form}`"));
@@ -307,14 +565,16 @@ impl<'a> Compiler<'a> {
         }
         let name_at = |i: usize| -> Result<(&'a str, Span), Diagnostic> {
             match items.get(i) {
-                Some(e) if sym(e).is_some() => Ok((sym(e).unwrap(), e.span)),
+                Some(e) if sym(e).is_some() => Ok((full.unwrap_or(sym(e).unwrap()), e.span)),
                 Some(e) => err(e.span, format!("expected a name, found `{e}`")),
                 None => err(span, "expected a name"),
             }
         };
         let (kind, name, name_span) = match head {
-            Some("defn") if scope.is_none() => return self.declare_func(items, span),
-            Some("fixpoint") if scope.is_none() => return self.declare_fixpoint(items, span),
+            Some("defn") if scope.is_none() => return self.declare_func(items, span, module, full),
+            Some("fixpoint") if scope.is_none() => {
+                return self.declare_fixpoint(items, span, module);
+            }
             Some("fixpoint") => return err(span, "fixpoints must be declared at the top level"),
             Some("defn") => return err(span, "functions must be defined at the top level"),
             Some("input") => {
@@ -360,7 +620,9 @@ impl<'a> Compiler<'a> {
             _ => {
                 return err(
                     span,
-                    format!("expected input, def, defn, collection, unit or enum, found `{form}`"),
+                    format!(
+                        "expected input, def, defn, collection, fixpoint, module, include, unit or enum, found `{form}`"
+                    ),
                 );
             }
         };
@@ -373,12 +635,17 @@ impl<'a> Compiler<'a> {
             return err(name_span, format!("`{name}` is defined twice"));
         }
         let is_collection = matches!(kind, DeclKind::Collection);
-        self.decls.push(Decl { name, kind, scope });
+        self.decls.push(Decl {
+            name,
+            kind,
+            scope,
+            module,
+        });
         self.state.push(State::Todo);
         self.types.push(Type::Unknown);
         if is_collection {
             for field in &items[2..] {
-                if let Err(e) = self.declare(field, Some(i)) {
+                if let Err(e) = self.declare(field, Some(i), module, None) {
                     self.errors.push(e);
                 }
             }
@@ -403,7 +670,13 @@ impl<'a> Compiler<'a> {
     }
 
     /// `(defn name [param : type …] body)`.
-    fn declare_func(&mut self, items: &'a [SExpr], span: Span) -> Result<(), Diagnostic> {
+    fn declare_func(
+        &mut self,
+        items: &'a [SExpr],
+        span: Span,
+        module: usize,
+        full: Option<&'a str>,
+    ) -> Result<(), Diagnostic> {
         let usage = "expected (defn name [param : type …] body)";
         let [_, name, params, body] = items else {
             return err(span, usage);
@@ -428,12 +701,14 @@ impl<'a> Compiler<'a> {
             typed.push((p, self.type_expr(&triple[2])?));
         }
         let func = Func {
+            module,
             params: typed,
             body,
             state: FuncState::Todo,
         };
-        if self.funcs.insert(name_str, func).is_some() {
-            return err(name.span, format!("`{name_str}` is defined twice"));
+        let key = full.unwrap_or(name_str);
+        if self.funcs.insert(key, func).is_some() {
+            return err(name.span, format!("`{key}` is defined twice"));
         }
         Ok(())
     }
@@ -448,6 +723,7 @@ impl<'a> Compiler<'a> {
         }
         let mut scope = Scope {
             vars: func.params.clone(),
+            module: func.module,
             ..Scope::default()
         };
         let body = func.body;
@@ -549,7 +825,10 @@ impl<'a> Compiler<'a> {
         };
         self.state[i] = State::Visiting;
         self.stack.push(i);
-        let mut scope = Scope::default();
+        let mut scope = Scope {
+            module: self.decls[i].module,
+            ..Scope::default()
+        };
         scope.collections.extend(self.decls[i].scope);
         let (expr, ty) = self.expr(body, &mut scope).unwrap_or_else(|e| {
             self.errors.push(e);
@@ -652,7 +931,7 @@ impl<'a> Compiler<'a> {
                 return Ok((Expr::Field { id, collection }, ty));
             }
         }
-        if let Some(&i) = self.globals.get(s) {
+        if let Some(i) = self.global(scope.module, s) {
             if scope.in_group
                 && let Some(active) = &self.active
                 && let Some(&slot) = active.slots.get(&i)
@@ -853,8 +1132,8 @@ impl<'a> Compiler<'a> {
             "sum" | "count" | "any" | "all" | "min-of" | "max-of" => {
                 self.aggregate(f, args, span, scope)
             }
-            _ if self.funcs.contains_key(f) => {
-                let name = *self.funcs.get_key_value(f).expect("checked").0;
+            _ if self.func(scope.module, f).is_some() => {
+                let name = self.func(scope.module, f).expect("checked");
                 self.apply(name, args, span, scope)
             }
             _ => {
@@ -938,6 +1217,7 @@ impl<'a> Compiler<'a> {
             }
         }
         let mismatch = |e: ValueError| Diagnostic {
+            file: String::new(),
             span,
             message: e.to_string(),
         };
@@ -1009,6 +1289,7 @@ impl<'a> Compiler<'a> {
             let arm = values.len() - 1;
             for l in labels {
                 let name = sym(l).ok_or_else(|| Diagnostic {
+                    file: String::new(),
                     span: l.span,
                     message: format!("expected a variant of `{}`", def.name),
                 })?;
@@ -1065,8 +1346,8 @@ impl<'a> Compiler<'a> {
         let Some(coll) = args.first() else {
             return err(span, usage());
         };
-        let c = match sym(coll).and_then(|s| self.globals.get(s)) {
-            Some(&c) if matches!(self.decls[c].kind, DeclKind::Collection) => c,
+        let c = match sym(coll).and_then(|s| self.global(scope.module, s)) {
+            Some(c) if matches!(self.decls[c].kind, DeclKind::Collection) => c,
             _ => return err(coll.span, format!("`{coll}` is not a collection")),
         };
         let State::Done(collection) = self.state[c] else {
@@ -1135,6 +1416,7 @@ fn rule(expr: Expr) -> impl Fn(&mut Context<'_, Value>) -> Value + Send + Sync +
 /// What the cycle finder needs to avoid: names that aren't references.
 #[derive(Default)]
 struct Walk<'a> {
+    module: usize,
     bound: Vec<&'a str>,
     collections: Vec<usize>,
     funcs: Vec<&'a str>,
@@ -1142,7 +1424,12 @@ struct Walk<'a> {
 }
 
 impl<'a> Compiler<'a> {
-    fn declare_fixpoint(&mut self, items: &'a [SExpr], span: Span) -> Result<(), Diagnostic> {
+    fn declare_fixpoint(
+        &mut self,
+        items: &'a [SExpr],
+        span: Span,
+        module: usize,
+    ) -> Result<(), Diagnostic> {
         let usage = "expected (fixpoint name :start value [:within tolerance] [:max rounds])";
         let Some(name) = items.get(1).and_then(sym) else {
             return err(span, usage);
@@ -1166,11 +1453,17 @@ impl<'a> Compiler<'a> {
         let Some(start) = start else {
             return err(span, format!("fixpoint `{name}` needs a :start"));
         };
-        if self.fixpoints.iter().any(|f| f.name == name) {
+        if self
+            .fixpoints
+            .iter()
+            .any(|f| f.name == name && f.module == module)
+        {
             return err(items[1].span, format!("fixpoint `{name}` declared twice"));
         }
         self.fixpoints.push(FixDecl {
             name,
+            module,
+            decl: None,
             span: items[1].span,
             start,
             within,
@@ -1186,10 +1479,18 @@ impl<'a> Compiler<'a> {
         self.group_of = vec![None; n];
         self.reported = vec![false; n];
         let mut edges = vec![Vec::new(); n];
+        for f in 0..self.fixpoints.len() {
+            let FixDecl { name, module, .. } = self.fixpoints[f];
+            self.fixpoints[f].decl = self.global(module, name);
+        }
         for (i, edge) in edges.iter_mut().enumerate() {
             if let (DeclKind::Def(body), None) = (&self.decls[i].kind, self.decls[i].scope) {
                 let mut out = BTreeSet::new();
-                self.refs(body, &mut Walk::default(), &mut out);
+                let mut walk = Walk {
+                    module: self.decls[i].module,
+                    ..Walk::default()
+                };
+                self.refs(body, &mut walk, &mut out);
                 *edge = out.into_iter().collect();
             }
         }
@@ -1197,8 +1498,9 @@ impl<'a> Compiler<'a> {
         for component in cycles::cycles(&edges) {
             let breaks: Vec<usize> = (0..self.fixpoints.len())
                 .filter(|&f| {
-                    let decl = self.globals.get(self.fixpoints[f].name);
-                    decl.is_some_and(|d| component.contains(d))
+                    self.fixpoints[f]
+                        .decl
+                        .is_some_and(|d| component.contains(&d))
                 })
                 .collect();
             if breaks.is_empty() {
@@ -1209,7 +1511,7 @@ impl<'a> Compiler<'a> {
             }
             let cut: Vec<usize> = breaks
                 .iter()
-                .map(|&b| self.globals[self.fixpoints[b].name])
+                .map(|&b| self.fixpoints[b].decl.expect("in the component"))
                 .collect();
             let Some(members) = cycles::order(&component, &edges, &cut) else {
                 let names: Vec<&str> = component.iter().map(|&d| self.decls[d].name).collect();
@@ -1217,6 +1519,7 @@ impl<'a> Compiler<'a> {
                     self.reported[d] = true;
                 }
                 self.errors.push(Diagnostic {
+                    file: String::new(),
                     span: self.fixpoints[breaks[0]].span,
                     message: format!(
                         "the cycle through {} needs more fixpoints to break it",
@@ -1234,12 +1537,18 @@ impl<'a> Compiler<'a> {
             if claimed {
                 continue;
             }
-            let FixDecl { name, span, .. } = self.fixpoints[f];
-            let message = match self.globals.get(name).map(|&d| &self.decls[d].kind) {
+            let FixDecl {
+                name, span, decl, ..
+            } = self.fixpoints[f];
+            let message = match decl.map(|d| &self.decls[d].kind) {
                 Some(DeclKind::Def(_)) => format!("`{name}` isn't in a cycle"),
                 _ => format!("fixpoint `{name}` names no def"),
             };
-            self.errors.push(Diagnostic { span, message });
+            self.errors.push(Diagnostic {
+                file: String::new(),
+                span,
+                message,
+            });
         }
     }
 
@@ -1291,8 +1600,11 @@ impl<'a> Compiler<'a> {
                         }
                     }
                     Some("sum" | "count" | "any" | "all" | "min-of" | "max-of") => {
-                        let c = args.first().and_then(sym).and_then(|s| self.globals.get(s));
-                        match c.copied() {
+                        let c = args
+                            .first()
+                            .and_then(sym)
+                            .and_then(|s| self.global(walk.module, s));
+                        match c {
                             Some(c) if matches!(self.decls[c].kind, DeclKind::Collection) => {
                                 walk.collections.push(c);
                                 for a in &args[1..] {
@@ -1311,10 +1623,12 @@ impl<'a> Compiler<'a> {
                         for a in args {
                             self.refs(a, walk, out);
                         }
-                        if let Some((&name, func)) = self.funcs.get_key_value(f)
+                        if let Some(name) = self.func(walk.module, f)
                             && !walk.funcs.contains(&name)
                         {
+                            let func = &self.funcs[name];
                             let mut inner = Walk {
+                                module: func.module,
                                 bound: func.params.iter().map(|(p, _)| *p).collect(),
                                 funcs: std::mem::take(&mut walk.funcs),
                                 fields: std::mem::take(&mut walk.fields),
@@ -1348,6 +1662,7 @@ impl<'a> Compiler<'a> {
                     && !walk.fields.contains(&f)
                 {
                     let mut inner = Walk {
+                        module: self.decls[f].module,
                         collections: vec![c],
                         funcs: std::mem::take(&mut walk.funcs),
                         fields: std::mem::take(&mut walk.fields),
@@ -1362,7 +1677,7 @@ impl<'a> Compiler<'a> {
                 return;
             }
         }
-        if let Some(&d) = self.globals.get(s)
+        if let Some(d) = self.global(walk.module, s)
             && matches!(self.decls[d].kind, DeclKind::Def(_))
         {
             out.insert(d);
@@ -1398,12 +1713,13 @@ impl<'a> Compiler<'a> {
         let mut starts = Vec::new();
         let mut max = 0;
         for &b in &breaks {
-            let (name, start, within) = {
+            let (decl, start, within) = {
                 let f = &self.fixpoints[b];
                 max = max.max(f.max);
-                (f.name, f.start, f.within)
+                (f.decl.expect("resolved"), f.start, f.within)
             };
-            let slot = slots[&self.globals[name]];
+            let name = self.decls[decl].name;
+            let slot = slots[&decl];
             let (start, ty) = match self.literal(start) {
                 Ok(x) => x,
                 Err(e) => {
@@ -1417,6 +1733,7 @@ impl<'a> Compiler<'a> {
                 Some(Ok((_, t))) => {
                     let span = within.unwrap().span;
                     self.errors.push(Diagnostic {
+                        file: String::new(),
                         span,
                         message: format!("`{name}` is {ty}, so :within must be too, not {t}"),
                     });
@@ -1440,6 +1757,7 @@ impl<'a> Compiler<'a> {
             self.stack.push(m);
             let mut scope = Scope {
                 in_group: true,
+                module: self.decls[m].module,
                 ..Scope::default()
             };
             let (expr, ty) = self.expr(body, &mut scope).unwrap_or_else(|e| {
@@ -1452,6 +1770,7 @@ impl<'a> Compiler<'a> {
                 Some(start) if !ty.matches(start) => {
                     let name = self.decls[m].name;
                     self.errors.push(Diagnostic {
+                        file: String::new(),
                         span: body.span,
                         message: format!(
                             "fixpoint `{name}` starts as {start} but is computed as {ty}"
@@ -1470,7 +1789,7 @@ impl<'a> Compiler<'a> {
             .map(|t| t.unwrap_or(Type::Unknown))
             .collect();
 
-        let first = self.fixpoints[breaks[0]].name;
+        let first = self.decls[self.fixpoints[breaks[0]].decl.expect("resolved")].name;
         let fixpoint = Fixpoint {
             order,
             breaks: starts,

@@ -46,13 +46,43 @@ pub struct Program {
 
 /// Parse, check and compile a program against `domain`.
 pub fn load(src: &str, domain: &Domain) -> Result<Program, Vec<Diagnostic>> {
-    let c = compile::compile(src, domain)?;
-    Ok(Program {
-        graph: c.graph,
-        domain: c.domain,
-        types: c.types,
-        defaulted: c.defaulted,
-    })
+    Ok(Program::from(compile::compile(src, domain)?))
+}
+
+/// Load a program spread over files: `main`, and everything it reaches
+/// through `(include "name")`. `read` returns a file's source by name, so
+/// files can come from disk, memory or anywhere else:
+///
+/// ```
+/// use factlet::lisp::{Domain, load_files};
+///
+/// let files = [
+///     ("main.lisp", "(include \"law.lisp\") (input wages : number) (def tax (* law/rate wages))"),
+///     ("law.lisp", "(module law (def rate 10%))"),
+/// ];
+/// let read = |name: &str| files.iter().find(|f| f.0 == name).map(|f| f.1.to_string());
+/// let program = load_files("main.lisp", read, &Domain::new()).unwrap();
+/// assert!(program.graph.is_folded(program.id("law/rate").unwrap()));
+/// ```
+pub fn load_files(
+    main: &str,
+    mut read: impl FnMut(&str) -> Option<String>,
+    domain: &Domain,
+) -> Result<Program, Vec<Diagnostic>> {
+    Ok(Program::from(compile::compile_files(
+        main, &mut read, domain,
+    )?))
+}
+
+impl From<compile::Compiled> for Program {
+    fn from(c: compile::Compiled) -> Program {
+        Program {
+            graph: c.graph,
+            domain: c.domain,
+            types: c.types,
+            defaulted: c.defaulted,
+        }
+    }
 }
 
 impl Program {

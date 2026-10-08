@@ -1,12 +1,15 @@
 use std::fmt;
 
-/// A byte range in the source, with the 1-based line and column it starts at.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// A byte range in a source file, with the 1-based line and column it
+/// starts at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
     pub line: u32,
     pub col: u32,
+    /// Which file, when a program has several; 0 otherwise.
+    pub file: u32,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -57,11 +60,17 @@ impl std::error::Error for ReadError {}
 
 /// Read every form in `src`.
 pub fn read(src: &str) -> Result<Vec<SExpr>, ReadError> {
+    read_file(src, 0)
+}
+
+/// Read every form in `src`, marking spans as from `file`.
+pub fn read_file(src: &str, file: u32) -> Result<Vec<SExpr>, ReadError> {
     let mut r = Parser {
         src,
         pos: 0,
         line: 1,
         col: 1,
+        file,
     };
     let mut forms = Vec::new();
     while r.skip_space() {
@@ -75,6 +84,7 @@ struct Parser<'a> {
     pos: usize,
     line: u32,
     col: u32,
+    file: u32,
 }
 
 const DELIMS: &str = "()[]\";'";
@@ -118,6 +128,7 @@ impl Parser<'_> {
             end: self.pos,
             line: self.line,
             col: self.col,
+            file: self.file,
         }
     }
 

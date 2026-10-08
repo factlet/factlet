@@ -1,7 +1,7 @@
 use factlet::{
     Case, Graph,
     case::{Error, Stats},
-    graph::BuildError,
+    graph::{BuildError, Kind},
 };
 
 #[test]
@@ -199,4 +199,30 @@ fn fork_keeps_memos() {
     c.reset_stats();
     assert_eq!(c.get(total), 30);
     assert_eq!(c.stats(), Stats::default(), "the original is untouched");
+}
+
+#[test]
+fn law_only_rules_fold() {
+    let mut b = Graph::<i64>::builder();
+    let base = b.constant("base", 15_000);
+    let bonus = b.constant("bonus", 750);
+    let std = b.derived("std", move |cx| cx.get(base) + cx.get(bonus));
+    let half = b.derived("half", move |cx| cx.get(std) / 2);
+    let wages = b.input("wages", 0);
+    let taxable = b.derived("taxable", move |cx| (cx.get(wages) - cx.get(std)).max(0));
+    let g = b.build().unwrap();
+    assert_eq!(g.folded(), 2);
+    assert!(g.is_folded(std) && g.is_folded(half) && !g.is_folded(taxable));
+    assert_eq!(g.kind(std), Kind::Derived);
+
+    let mut c = Case::new(g);
+    assert_eq!(c.get(half), 7_875);
+    assert_eq!(&*c.deps(std), &[base, bonus]);
+    assert_eq!(c.stats().executed, 0, "folded facts never run per case");
+
+    c.set(wages, 20_000).unwrap();
+    assert_eq!(c.get(taxable), 4_250);
+    assert_eq!(c.stats().executed, 1);
+    assert_eq!(c.set(std, 0), Err(Error("std".into())));
+    c.check_invariants();
 }

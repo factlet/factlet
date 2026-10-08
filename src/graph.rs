@@ -1,4 +1,4 @@
-use crate::case::Context;
+use crate::case::{Case, Context};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ pub(crate) enum Def<V> {
     Constant(V),
     Input(V),
     Derived(Rule<V>),
+    Folded { value: V, deps: Arc<[usize]> },
 }
 
 pub struct Graph<V> {
@@ -48,8 +49,20 @@ impl<V> Graph<V> {
         match &self.defs[id] {
             Def::Constant(_) => Kind::Constant,
             Def::Input(_) => Kind::Input,
-            Def::Derived(_) => Kind::Derived,
+            Def::Derived(_) | Def::Folded { .. } => Kind::Derived,
         }
+    }
+
+    pub fn is_folded(&self, id: usize) -> bool {
+        matches!(self.defs[id], Def::Folded { .. })
+    }
+
+    pub fn folded(&self) -> usize {
+        (0..self.len()).filter(|&id| self.is_folded(id)).count()
+    }
+
+    pub(crate) fn is_fixed(&self, id: usize) -> bool {
+        matches!(self.defs[id], Def::Constant(_) | Def::Folded { .. })
     }
 }
 
@@ -117,15 +130,42 @@ impl<V> Builder<V> {
         self.defs.push(def);
         id
     }
+}
 
+impl<V: Clone + PartialEq> Builder<V> {
     pub fn build(self) -> Result<Arc<Graph<V>>, Vec<BuildError>> {
         if !self.errors.is_empty() {
             return Err(self.errors);
         }
-        Ok(Arc::new(Graph {
+        let probe = Arc::new(Graph {
             defs: self.defs.into(),
             names: self.names.into(),
             by_name: self.by_name,
-        }))
+        });
+
+        // Ids are in dependency order, so one pass finds every rule that
+        // reads only constants and rules already folded.
+        let mut case = Case::new(probe.clone());
+        let mut fold = vec![false; probe.len()];
+        let mut folded = Vec::new();
+        for id in 0..probe.len() {
+            if !matches!(probe.defs[id], Def::Derived(_)) {
+                continue;
+            }
+            let deps = case.deps(id);
+            if deps.iter().all(|&d| fold[d] || probe.is_fixed(d)) {
+                fold[id] = true;
+                folded.push((id, case.get(id), deps));
+            }
+        }
+        drop(case);
+
+        let mut graph = Arc::into_inner(probe).expect("probe case dropped");
+        let mut defs = graph.defs.into_vec();
+        for (id, value, deps) in folded {
+            defs[id] = Def::Folded { value, deps };
+        }
+        graph.defs = defs.into();
+        Ok(Arc::new(graph))
     }
 }

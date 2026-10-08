@@ -112,6 +112,9 @@ impl<V: Clone + PartialEq> Case<V> {
     }
 
     pub fn deps(&mut self, id: usize) -> Arc<[usize]> {
+        if let Def::Folded { deps, .. } = &self.graph.defs[id] {
+            return deps.clone();
+        }
         self.state.refresh(&self.graph, id);
         self.state.slots[id].deps.clone()
     }
@@ -172,7 +175,7 @@ impl<V: Clone + PartialEq> Case<V> {
                 );
             }
             for &d in slot.deps.iter() {
-                if !matches!(g.defs[d], Def::Constant(_)) {
+                if !g.is_fixed(d) {
                     assert!(
                         slots[d].dependents.contains(&f),
                         "{} reads {}, which doesn't list it",
@@ -220,7 +223,7 @@ impl<V: Clone + PartialEq> State<V> {
             }
         }
         for &d in new.iter().filter(|d| old.binary_search(d).is_err()) {
-            if !matches!(g.defs[d], Def::Constant(_)) {
+            if !g.is_fixed(d) {
                 self.slots[d].dependents.push(id);
             }
         }
@@ -228,7 +231,7 @@ impl<V: Clone + PartialEq> State<V> {
 
     fn value<'a>(&'a self, g: &'a Graph<V>, id: usize) -> &'a V {
         match (&g.defs[id], &self.slots[id].value) {
-            (Def::Constant(v), _) | (_, Some(v)) => v,
+            (Def::Constant(v) | Def::Folded { value: v, .. }, _) | (_, Some(v)) => v,
             (Def::Input(default), None) => default,
             (Def::Derived(_), None) => unreachable!("read a rule before refreshing it"),
         }
@@ -237,7 +240,7 @@ impl<V: Clone + PartialEq> State<V> {
     fn refresh(&mut self, g: &Graph<V>, id: usize) -> u64 {
         let slot = &self.slots[id];
         match &g.defs[id] {
-            Def::Constant(_) => 0,
+            Def::Constant(_) | Def::Folded { .. } => 0,
             Def::Input(_) => slot.changed_at,
             Def::Derived(_) if slot.value.is_none() => self.execute(g, id),
             Def::Derived(_) if !slot.changed => slot.changed_at,
